@@ -3,7 +3,7 @@ FROM node:20-alpine AS deps
 WORKDIR /app
 COPY package*.json ./
 COPY prisma ./prisma
-RUN npm ci
+RUN npm install --omit=dev
 RUN npx prisma generate
 
 # ── Stage 2: production image ───────────────────────────────────────────────────

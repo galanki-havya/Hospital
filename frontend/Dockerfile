@@ -2,7 +2,7 @@
 FROM node:20-alpine AS build
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci
+RUN npm install
 COPY . .
 # VITE_API_URL is baked in at build time. Leave unset to call the API via the
 # nginx reverse proxy below (same-origin /api/v1 — simplest for most deploys).
