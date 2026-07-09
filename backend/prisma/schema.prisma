@@ -1,0 +1,3135 @@
+// MediCore HMS — Prisma Schema
+// Multi-tenant Hospital Management System
+//
+// Scope note: the source DDL (db.txt) defines ~120 tables across 20+ modules.
+// This schema implements 47 of those tables across 13 modules end-to-end
+// (Platform/Auth, Departments & Doctors, Patients, Appointments, Visits/EMR,
+// IPD, Pharmacy, Lab, Radiology, Billing, HR, Notifications, Audit Logs).
+// Every table here matches the column names/types/relations in db.txt.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// PLATFORM / MULTI-TENANCY / AUTH
+
+enum TenantType {
+  Clinic
+  MultiSpeciality
+  SuperSpeciality
+}
+
+enum ActiveStatus {
+  Active
+  Inactive
+}
+
+// Platform-level operators. Completely separate identity space from
+// tenant Users/Roles below — a PlatformUser has no row in `users` and
+// cannot be looked up by the tenant `authenticate` middleware, and a
+// tenant User has no row here and cannot pass `authenticatePlatform`.
+// This is what makes hospital-data isolation from Developer/SuperAdmin
+// structural rather than just a permission flag.
+enum PlatformRole {
+  Developer
+  SuperAdmin
+}
+
+model Tenant {
+  id        BigInt     @id @default(autoincrement())
+  name      String     @db.VarChar(255)
+  code      String     @unique @db.VarChar(50)
+  type      TenantType
+  domain    String?    @db.VarChar(255)
+  logoUrl   String?    @map("logo_url") @db.Text
+  phone     String?    @db.VarChar(20)
+  email     String?    @db.VarChar(150)
+  address   String?    @db.Text
+  status    ActiveStatus @default(Active)
+  suspendedReason      String?    @map("suspended_reason") @db.Text
+  plan                 String?    @default("Trial") @db.VarChar(50)
+  planExpiresAt        DateTime?  @map("plan_expires_at")
+  officeLat            Decimal?   @map("office_lat") @db.Decimal(10, 7)
+  officeLng            Decimal?   @map("office_lng") @db.Decimal(10, 7)
+  geofenceRadiusMeters Int?       @map("geofence_radius_meters")
+  createdAt DateTime   @default(now()) @map("created_at")
+  updatedAt DateTime   @updatedAt @map("updated_at")
+  deletedAt DateTime?  @map("deleted_at")
+
+  // Which platform operator (SuperAdmin/Developer) provisioned this hospital.
+  // Never used to grant that operator any access back into tenant data —
+  // it's metadata only, read by platform-side reporting.
+  createdByPlatformUserId BigInt?      @map("created_by_platform_user_id")
+  createdByPlatformUser   PlatformUser? @relation(fields: [createdByPlatformUserId], references: [id])
+
+  roles            Role[]
+  tenantUsers      TenantUser[]
+  departments      Department[]
+  doctors          Doctor[]
+  patients         Patient[]
+  appointments     Appointment[]
+  visits           Visit[]
+  wards            Ward[]
+  rooms            Room[]
+  beds             Bed[]
+  admissions       Admission[]
+  suppliers        Supplier[]
+  medicineCategories MedicineCategory[]
+  medicines        Medicine[]
+  pharmacySales    PharmacySale[]
+  labCategories    LabCategory[]
+  labTests         LabTest[]
+  labOrders        LabOrder[]
+  radiologyServices RadiologyService[]
+  radiologyOrders  RadiologyOrder[]
+  billingCategories BillingCategory[]
+  bills            Bill[]
+  payments         Payment[]
+  designations     Designation[]
+  employees        Employee[]
+  leaveTypes       LeaveType[]
+  notifications    Notification[]
+  auditLogs        AuditLog[]
+  prescriptions    Prescription[]
+  medicalRecords   MedicalRecord[]
+  emergencyCases   EmergencyCase[]
+  otRooms          OTRoom[]
+  otSchedules      OTSchedule[]
+  insurancePayers  InsurancePayer[]
+  insuranceClaims  InsuranceClaim[]
+  bloodDonors      BloodDonor[]
+  bloodUnits       BloodUnit[]
+  dietPlans        DietPlan[]
+  dietAssignments  DietAssignment[]
+  inventoryCategories InventoryCategory[]
+  inventoryItems   InventoryItem[]
+  purchaseOrders   PurchaseOrder[]
+  stockTransactions StockTransaction[]
+  shiftTemplates   ShiftTemplate[]
+  shiftAssignments ShiftAssignment[]
+  doctorRevenueRules DoctorRevenueRule[]
+  doctorRevenueEntries DoctorRevenueEntry[]
+  incentiveRules   IncentiveRule[]
+  incentiveEntries IncentiveEntry[]
+  employeeLoans    EmployeeLoan[]
+  jobPostings      JobPosting[]
+  jobApplications  JobApplication[]
+  documentVault    DocumentVault[]
+  letterTemplates  LetterTemplate[]
+  letterIssuances  LetterIssuance[]
+  performanceReviews PerformanceReview[]
+  overtimeRecords   OvertimeRecord[]
+  statutoryRegisters StatutoryRegister[]
+  ambulances       Ambulance[]
+  ambulanceCalls   AmbulanceCall[]
+  visitors         Visitor[]
+  complaints       Complaint[]
+  mortuaryRecords  MortuaryRecord[]
+  qrCheckIns       QRCheckIn[]
+  salaryStructures  SalaryStructure[]
+  salaryAssignments SalaryAssignment[]
+  bookingSlugs      BookingSlug[]
+  notificationTemplates NotificationTemplate[]
+  notificationLogs  NotificationLog[]
+  prescriptionSeals PrescriptionSeal[]
+  cssdItems         CssdItem[]
+  cssdPacks         CssdPack[]
+  cssdCycles        CssdCycle[]
+  encounters        Encounter[]
+  serviceMasters    ServiceMaster[]
+  clinicalOrders    ClinicalOrder[]
+  paymentSplits     PaymentSplit[]
+  bedStatusHistory  BedStatusHistory[]
+  auditLogsExtended AuditLogExtended[]
+  employeeDocuments EmployeeDocument[]
+  biometricDevices  BiometricDevice[]
+  biometricLogs     BiometricLog[]
+  mobileAppConfig   MobileAppConfig?
+  mobileAppRegistrations MobileAppRegistration[]
+  voiceNotes        VoiceNote[]
+
+  @@map("tenants")
+}
+
+// PLATFORM ADMIN LAYER (Developer + SuperAdmin)
+//
+// These accounts live OUTSIDE every tenant. They are never inserted into
+// `tenant_users`, are never assigned a tenant `Role`, and their JWTs never
+// carry a tenantId claim. Every platform route/service in this codebase
+// only ever touches the `Tenant` table and aggregate counts of it — never
+// Patient/Visit/Prescription/etc. So a SuperAdmin genuinely cannot see any
+// hospital's clinical or operational data, by construction, not by policy.
+//
+// Developer: bootstraps the platform, creates/manages SuperAdmin accounts,
+//            full platform settings.
+// SuperAdmin: creates hospitals (tenants), sees only how many/which
+//             hospitals exist + basic status, activates/suspends them,
+//             manages subscription plan, resets a Hospital Admin's
+//             password. Cannot view patients, staff rosters, records, etc.
+
+model PlatformUser {
+  id            BigInt       @id @default(autoincrement())
+  email         String       @unique @db.VarChar(150)
+  passwordHash  String       @map("password_hash") @db.Text
+  firstName     String?      @map("first_name") @db.VarChar(100)
+  lastName      String?      @map("last_name") @db.VarChar(100)
+  role          PlatformRole
+  isActive      Boolean      @default(true) @map("is_active")
+  lastLogin     DateTime?    @map("last_login")
+  createdAt     DateTime     @default(now()) @map("created_at")
+  updatedAt     DateTime     @updatedAt @map("updated_at")
+
+  createdByPlatformUserId BigInt?       @map("created_by_platform_user_id")
+  createdBy               PlatformUser?  @relation("PlatformUserCreatedBy", fields: [createdByPlatformUserId], references: [id])
+  createdPlatformUsers    PlatformUser[] @relation("PlatformUserCreatedBy")
+
+  createdTenants Tenant[]
+  sessions       PlatformUserSession[]
+  auditLogs      PlatformAuditLog[]
+
+  @@index([role])
+  @@map("platform_users")
+}
+
+model PlatformUserSession {
+  id             BigInt   @id @default(autoincrement())
+  platformUserId BigInt   @map("platform_user_id")
+  refreshToken   String   @db.Text
+  deviceName     String?  @map("device_name")
+  expiresAt      DateTime @map("expires_at")
+  createdAt      DateTime @default(now()) @map("created_at")
+  revokedAt      DateTime? @map("revoked_at")
+
+  platformUser PlatformUser @relation(fields: [platformUserId], references: [id])
+
+  @@index([platformUserId])
+  @@map("platform_user_sessions")
+}
+
+model PlatformAuditLog {
+  id             BigInt   @id @default(autoincrement())
+  platformUserId BigInt?  @map("platform_user_id")
+  actionType     String   @map("action_type") @db.VarChar(100)
+  targetTenantId BigInt?  @map("target_tenant_id")
+  metadata       Json?
+  ipAddress      String?  @map("ip_address")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  platformUser PlatformUser? @relation(fields: [platformUserId], references: [id])
+
+  @@index([platformUserId])
+  @@index([targetTenantId])
+  @@map("platform_audit_logs")
+}
+
+model User {
+  id            BigInt    @id @default(autoincrement())
+  email         String    @unique @db.VarChar(150)
+  passwordHash  String    @map("password_hash") @db.Text
+  firstName     String?   @map("first_name") @db.VarChar(100)
+  lastName      String?   @map("last_name") @db.VarChar(100)
+  phone         String?   @db.VarChar(20)
+  profilePhoto  String?   @map("profile_photo") @db.Text
+  emailVerified Boolean   @default(false) @map("email_verified")
+  isActive      Boolean   @default(true) @map("is_active")
+  lastLogin     DateTime? @map("last_login")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+  deletedAt     DateTime? @map("deleted_at")
+
+  tenantUsers   TenantUser[]
+  doctor        Doctor?
+  employee      Employee?
+  sessions      UserSession[]
+  auditLogs     AuditLog[]
+  notifications Notification[]
+  uploadedFiles File[]
+  voiceNotes    VoiceNote[]
+
+  @@index([email])
+  @@index([isActive])
+  @@map("users")
+}
+
+model Role {
+  id          BigInt   @id @default(autoincrement())
+  tenantId    BigInt   @map("tenant_id")
+  name        String   @db.VarChar(100)
+  description String?  @db.Text
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  tenant      Tenant   @relation(fields: [tenantId], references: [id])
+  tenantUsers TenantUser[]
+  permissions RolePermission[]
+
+  @@index([tenantId])
+  @@map("roles")
+}
+
+model Permission {
+  id         BigInt   @id @default(autoincrement())
+  name       String   @unique @db.VarChar(150)
+  moduleName String?  @map("module_name") @db.VarChar(100)
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  roles RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       BigInt @map("role_id")
+  permissionId BigInt @map("permission_id")
+
+  role       Role       @relation(fields: [roleId], references: [id])
+  permission Permission @relation(fields: [permissionId], references: [id])
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model TenantUser {
+  id        BigInt   @id @default(autoincrement())
+  tenantId  BigInt   @map("tenant_id")
+  userId    BigInt   @map("user_id")
+  roleId    BigInt   @map("role_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  user   User   @relation(fields: [userId], references: [id])
+  role   Role   @relation(fields: [roleId], references: [id])
+
+  @@index([tenantId])
+  @@index([userId])
+  @@map("tenant_users")
+}
+
+model UserSession {
+  id           BigInt    @id @default(autoincrement())
+  userId       BigInt    @map("user_id")
+  refreshToken String?   @map("refresh_token") @db.Text
+  deviceName   String?   @map("device_name") @db.VarChar(255)
+  ipAddress    String?   @map("ip_address") @db.VarChar(100)
+  expiresAt    DateTime? @map("expires_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("user_sessions")
+}
+
+model AuditLog {
+  id          BigInt   @id @default(autoincrement())
+  tenantId    BigInt   @map("tenant_id")
+  userId      BigInt?  @map("user_id")
+  moduleName  String?  @map("module_name") @db.VarChar(150)
+  actionType  String?  @map("action_type") @db.VarChar(100)
+  entityName  String?  @map("entity_name") @db.VarChar(150)
+  entityId    BigInt?  @map("entity_id")
+  oldValues   Json?    @map("old_values")
+  newValues   Json?    @map("new_values")
+  ipAddress   String?  @map("ip_address") @db.VarChar(100)
+  userAgent   String?  @map("user_agent") @db.Text
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  user   User?  @relation(fields: [userId], references: [id])
+
+  @@index([tenantId])
+  @@index([userId])
+  @@index([entityName, entityId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// DEPARTMENTS & DOCTORS
+
+model Department {
+  id          BigInt       @id @default(autoincrement())
+  tenantId    BigInt       @map("tenant_id")
+  name        String       @db.VarChar(150)
+  description String?      @db.Text
+  status      ActiveStatus @default(Active)
+  createdAt   DateTime     @default(now()) @map("created_at")
+  updatedAt   DateTime     @updatedAt @map("updated_at")
+  deletedAt   DateTime?    @map("deleted_at")
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id])
+  doctors   Doctor[]
+  employees Employee[]
+
+  @@index([tenantId])
+  @@map("departments")
+}
+
+model Doctor {
+  id               BigInt       @id @default(autoincrement())
+  tenantId         BigInt       @map("tenant_id")
+  userId           BigInt       @unique @map("user_id")
+  departmentId     BigInt?      @map("department_id")
+  employeeCode     String?      @map("employee_code") @db.VarChar(50)
+  specialization   String?      @db.VarChar(150)
+  qualification    String?      @db.VarChar(255)
+  consultationFee  Decimal?     @map("consultation_fee") @db.Decimal(10, 2)
+  licenseNumber    String?      @map("license_number") @db.VarChar(100)
+  experienceYears  Int?         @map("experience_years")
+  status           ActiveStatus @default(Active)
+  createdAt        DateTime     @default(now()) @map("created_at")
+  updatedAt        DateTime     @updatedAt @map("updated_at")
+  deletedAt        DateTime?    @map("deleted_at")
+
+  tenant     Tenant            @relation(fields: [tenantId], references: [id])
+  user       User              @relation(fields: [userId], references: [id])
+  department Department?       @relation(fields: [departmentId], references: [id])
+  schedules  DoctorSchedule[]
+  appointments Appointment[]
+  visits     Visit[]
+  admissions Admission[]
+  clinicalNotes ClinicalNote[]
+  prescriptions Prescription[]
+  labOrders  LabOrder[]
+  radiologyOrders RadiologyOrder[]
+  emergencyCases EmergencyCase[]
+  otSchedules    OTSchedule[]
+  revenueRules   DoctorRevenueRule[]
+  revenueEntries DoctorRevenueEntry[]
+  prescriptionSeals PrescriptionSeal[]
+  encounters     Encounter[]
+  clinicalOrders ClinicalOrder[]
+  @@index([userId])
+  @@index([departmentId])
+  @@map("doctors")
+}
+
+model DoctorSchedule {
+  id          BigInt   @id @default(autoincrement())
+  tenantId    BigInt   @map("tenant_id")
+  doctorId    BigInt   @map("doctor_id")
+  dayOfWeek   Int      @map("day_of_week") // 0=Sunday..6=Saturday
+  startTime   DateTime @map("start_time") @db.Time()
+  endTime     DateTime @map("end_time") @db.Time()
+  maxPatients Int?     @map("max_patients")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  doctor Doctor @relation(fields: [doctorId], references: [id])
+
+  @@index([doctorId])
+  @@map("doctor_schedules")
+}
+
+// PATIENTS
+
+enum Gender {
+  Male
+  Female
+  Other
+}
+
+model Patient {
+  id                    BigInt       @id @default(autoincrement())
+  tenantId              BigInt       @map("tenant_id")
+  uhid                  String       @unique @db.VarChar(50)
+  firstName             String?      @map("first_name") @db.VarChar(100)
+  lastName              String?      @map("last_name") @db.VarChar(100)
+  gender                Gender?
+  dob                   DateTime?    @db.Date
+  bloodGroup            String?      @map("blood_group") @db.VarChar(10)
+  maritalStatus         String?      @map("marital_status") @db.VarChar(50)
+  nationality            String?      @db.VarChar(100)
+  occupation            String?      @db.VarChar(150)
+  phone                 String?      @db.VarChar(20)
+  email                 String?      @db.VarChar(150)
+  address               String?      @db.Text
+  city                  String?      @db.VarChar(100)
+  state                 String?      @db.VarChar(100)
+  country               String?      @db.VarChar(100)
+  emergencyContactName  String?      @map("emergency_contact_name") @db.VarChar(150)
+  emergencyContactPhone String?      @map("emergency_contact_phone") @db.VarChar(20)
+  status                ActiveStatus @default(Active)
+  createdAt             DateTime     @default(now()) @map("created_at")
+  updatedAt             DateTime     @updatedAt @map("updated_at")
+  deletedAt             DateTime?    @map("deleted_at")
+
+  tenant          Tenant                   @relation(fields: [tenantId], references: [id])
+  allergies       PatientAllergy[]
+  medicalHistory  PatientMedicalHistory[]
+  appointments    Appointment[]
+  visits          Visit[]
+  admissions      Admission[]
+  prescriptions   Prescription[]
+  pharmacySales   PharmacySale[]
+  labOrders       LabOrder[]
+  radiologyOrders RadiologyOrder[]
+  bills           Bill[]
+  emergencyCases  EmergencyCase[]
+  otSchedules     OTSchedule[]
+  insuranceClaims InsuranceClaim[]
+  dietAssignments DietAssignment[]
+  visitors        Visitor[]
+  complaints      Complaint[]
+  mortuaryRecords MortuaryRecord[]
+  encounters      Encounter[]
+  clinicalOrders  ClinicalOrder[]
+  mobileAppRegistrations MobileAppRegistration[]
+  voiceNotes      VoiceNote[]
+
+  @@index([tenantId])
+  @@index([uhid])
+  @@index([phone])
+  @@map("patients")
+}
+
+model PatientAllergy {
+  id           BigInt    @id @default(autoincrement())
+  patientId    BigInt    @map("patient_id")
+  allergyName  String?   @map("allergy_name") @db.VarChar(255)
+  severity     String?   @db.VarChar(100)
+  notes        String?   @db.Text
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+  deletedAt    DateTime? @map("deleted_at")
+
+  patient Patient @relation(fields: [patientId], references: [id])
+
+  @@index([patientId])
+  @@map("patient_allergies")
+}
+
+model PatientMedicalHistory {
+  id            BigInt   @id @default(autoincrement())
+  patientId     BigInt   @map("patient_id")
+  conditionName String?  @map("condition_name") @db.VarChar(255)
+  diagnosisDate DateTime? @map("diagnosis_date") @db.Date
+  notes         String?  @db.Text
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  patient Patient @relation(fields: [patientId], references: [id])
+
+  @@index([patientId])
+  @@map("patient_medical_history")
+}
+
+// APPOINTMENTS, VISITS, EMR
+
+enum AppointmentStatus {
+  Scheduled
+  CheckedIn
+  Completed
+  Cancelled
+  NoShow
+}
+
+model Appointment {
+  id               BigInt            @id @default(autoincrement())
+  tenantId         BigInt            @map("tenant_id")
+  patientId        BigInt            @map("patient_id")
+  doctorId         BigInt            @map("doctor_id")
+  appointmentTime  DateTime          @map("appointment_time")
+  tokenNumber      Int?              @map("token_number")
+  status           AppointmentStatus @default(Scheduled)
+  reason           String?           @db.Text
+  createdAt        DateTime          @default(now()) @map("created_at")
+  updatedAt        DateTime          @updatedAt @map("updated_at")
+  deletedAt        DateTime?         @map("deleted_at")
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id])
+  patient Patient @relation(fields: [patientId], references: [id])
+  doctor  Doctor  @relation(fields: [doctorId], references: [id])
+  visit   Visit?
+
+  @@index([tenantId])
+  @@index([patientId])
+  @@index([doctorId])
+  @@index([appointmentTime])
+  @@index([status])
+  @@map("appointments")
+}
+
+enum VisitType {
+  OPD
+  IPD
+  Emergency
+}
+
+model Visit {
+  id            BigInt    @id @default(autoincrement())
+  tenantId      BigInt    @map("tenant_id")
+  patientId     BigInt    @map("patient_id")
+  doctorId      BigInt    @map("doctor_id")
+  appointmentId BigInt?   @unique @map("appointment_id")
+  visitType     VisitType @map("visit_type")
+  status        String?   @db.VarChar(50)
+  visitDate     DateTime  @default(now()) @map("visit_date")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+  deletedAt     DateTime? @map("deleted_at")
+
+  tenant        Tenant          @relation(fields: [tenantId], references: [id])
+  patient       Patient         @relation(fields: [patientId], references: [id])
+  doctor        Doctor          @relation(fields: [doctorId], references: [id])
+  appointment   Appointment?    @relation(fields: [appointmentId], references: [id])
+  vitals        Vitals[]
+  medicalRecord MedicalRecord?
+  clinicalNotes ClinicalNote[]
+  prescriptions Prescription[]
+  admission     Admission?
+  labOrders     LabOrder[]
+  radiologyOrders RadiologyOrder[]
+
+  @@index([tenantId])
+  @@index([patientId])
+  @@index([doctorId])
+  @@index([visitDate])
+  @@map("visits")
+}
+
+model Vitals {
+  id                BigInt   @id @default(autoincrement())
+  visitId           BigInt   @map("visit_id")
+  temperature       Decimal? @db.Decimal(5, 2)
+  pulseRate         Int?     @map("pulse_rate")
+  respiratoryRate   Int?     @map("respiratory_rate")
+  bloodPressure     String?  @map("blood_pressure") @db.VarChar(50)
+  oxygenSaturation  Decimal? @map("oxygen_saturation") @db.Decimal(5, 2)
+  height            Decimal? @db.Decimal(5, 2)
+  weight            Decimal? @db.Decimal(5, 2)
+  bmi               Decimal? @db.Decimal(5, 2)
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  visit Visit @relation(fields: [visitId], references: [id])
+
+  @@index([visitId])
+  @@map("vitals")
+}
+
+model MedicalRecord {
+  id            BigInt    @id @default(autoincrement())
+  tenantId      BigInt    @map("tenant_id")
+  visitId       BigInt    @unique @map("visit_id")
+  diagnosis     String?   @db.Text
+  treatmentPlan String?   @map("treatment_plan") @db.Text
+  notes         String?   @db.Text
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+  deletedAt     DateTime? @map("deleted_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  visit  Visit  @relation(fields: [visitId], references: [id])
+
+  @@index([tenantId])
+  @@map("medical_records")
+}
+
+model ClinicalNote {
+  id        BigInt   @id @default(autoincrement())
+  visitId   BigInt   @map("visit_id")
+  doctorId  BigInt   @map("doctor_id")
+  notes     String?  @db.Text
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  visit  Visit  @relation(fields: [visitId], references: [id])
+  doctor Doctor @relation(fields: [doctorId], references: [id])
+
+  @@index([visitId])
+  @@index([doctorId])
+  @@map("clinical_notes")
+}
+
+model Prescription {
+  id                BigInt    @id @default(autoincrement())
+  tenantId          BigInt    @map("tenant_id")
+  visitId           BigInt    @map("visit_id")
+  patientId         BigInt    @map("patient_id")
+  doctorId          BigInt    @map("doctor_id")
+  prescriptionDate  DateTime  @default(now()) @map("prescription_date")
+  instructions      String?   @db.Text
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+  deletedAt         DateTime? @map("deleted_at")
+
+  tenant  Tenant              @relation(fields: [tenantId], references: [id])
+  visit   Visit               @relation(fields: [visitId], references: [id])
+  doctor  Doctor              @relation(fields: [doctorId], references: [id])
+  patient Patient             @relation(fields: [patientId], references: [id])
+  items   PrescriptionItem[]
+  pharmacySales PharmacySale[]
+
+  @@index([tenantId])
+  @@index([visitId])
+  @@index([doctorId])
+  @@index([patientId])
+  @@map("prescriptions")
+}
+
+model PrescriptionItem {
+  id              BigInt   @id @default(autoincrement())
+  prescriptionId  BigInt   @map("prescription_id")
+  medicineId      BigInt?  @map("medicine_id")
+  medicineName    String?  @map("medicine_name") @db.VarChar(255)
+  dosage          String?  @db.VarChar(100)
+  frequency       String?  @db.VarChar(100)
+  durationDays    Int?     @map("duration_days")
+  instructions    String?  @db.Text
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  prescription Prescription @relation(fields: [prescriptionId], references: [id])
+  medicine     Medicine?    @relation(fields: [medicineId], references: [id])
+
+  @@index([prescriptionId])
+  @@index([medicineId])
+  @@map("prescription_items")
+}
+
+// IPD — WARDS / ROOMS / BEDS / ADMISSIONS
+
+enum WardType {
+  General
+  SemiPrivate
+  Private
+  ICU
+  NICU
+  PICU
+  CCU
+}
+
+model Ward {
+  id          BigInt       @id @default(autoincrement())
+  tenantId    BigInt       @map("tenant_id")
+  name        String       @db.VarChar(100)
+  wardType    WardType     @map("ward_type")
+  floorNumber Int?         @map("floor_number")
+  status      ActiveStatus @default(Active)
+  createdAt   DateTime     @default(now()) @map("created_at")
+  updatedAt   DateTime     @updatedAt @map("updated_at")
+  deletedAt   DateTime?    @map("deleted_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  rooms  Room[]
+
+  @@index([tenantId])
+  @@map("wards")
+}
+
+enum RoomType {
+  General
+  Private
+  Deluxe
+  ICU
+}
+
+enum RoomStatus {
+  Available
+  Occupied
+  Maintenance
+}
+
+model Room {
+  id         BigInt     @id @default(autoincrement())
+  tenantId   BigInt     @map("tenant_id")
+  wardId     BigInt     @map("ward_id")
+  roomNumber String?    @map("room_number") @db.VarChar(50)
+  roomType   RoomType?  @map("room_type")
+  status     RoomStatus @default(Available)
+  createdAt  DateTime   @default(now()) @map("created_at")
+  updatedAt  DateTime   @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  ward   Ward   @relation(fields: [wardId], references: [id])
+  beds   Bed[]
+
+  @@index([tenantId])
+  @@index([wardId])
+  @@index([status])
+  @@map("rooms")
+}
+
+enum BedStatus {
+  Available
+  Occupied
+  Reserved
+  Maintenance
+}
+
+model Bed {
+  id        BigInt    @id @default(autoincrement())
+  tenantId  BigInt    @map("tenant_id")
+  roomId    BigInt    @map("room_id")
+  bedNumber String?   @map("bed_number") @db.VarChar(50)
+  status    BedStatus @default(Available)
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  tenant     Tenant      @relation(fields: [tenantId], references: [id])
+  room       Room        @relation(fields: [roomId], references: [id])
+  admissions Admission[]
+
+  @@index([tenantId])
+  @@index([roomId])
+  @@index([status])
+  statusHistory BedStatusHistory[]
+
+  @@map("beds")
+}
+
+enum AdmissionStatus {
+  Admitted
+  Discharged
+}
+
+model Admission {
+  id                     BigInt          @id @default(autoincrement())
+  tenantId               BigInt          @map("tenant_id")
+  patientId              BigInt          @map("patient_id")
+  visitId                BigInt?         @unique @map("visit_id")
+  bedId                  BigInt          @map("bed_id")
+  admittingDoctorId      BigInt?         @map("admitting_doctor_id")
+  admissionReason        String?         @map("admission_reason") @db.Text
+  admittedAt             DateTime        @default(now()) @map("admitted_at")
+  expectedDischargeDate  DateTime?       @map("expected_discharge_date") @db.Date
+  status                 AdmissionStatus @default(Admitted)
+  createdAt              DateTime        @default(now()) @map("created_at")
+  updatedAt              DateTime        @updatedAt @map("updated_at")
+  deletedAt              DateTime?       @map("deleted_at")
+
+  tenant          Tenant     @relation(fields: [tenantId], references: [id])
+  patient         Patient    @relation(fields: [patientId], references: [id])
+  visit           Visit?     @relation(fields: [visitId], references: [id])
+  bed             Bed        @relation(fields: [bedId], references: [id])
+  admittingDoctor Doctor?    @relation(fields: [admittingDoctorId], references: [id])
+  discharge       Discharge?
+
+  @@index([tenantId])
+  @@index([patientId])
+  @@index([bedId])
+  @@index([status])
+  @@map("admissions")
+}
+
+model Discharge {
+  id                BigInt   @id @default(autoincrement())
+  admissionId       BigInt   @unique @map("admission_id")
+  dischargeSummary  String?  @map("discharge_summary") @db.Text
+  dischargeDate     DateTime @default(now()) @map("discharge_date")
+  followupDate      DateTime? @map("followup_date") @db.Date
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  admission Admission @relation(fields: [admissionId], references: [id])
+
+  @@map("discharges")
+}
+
+// PHARMACY
+
+model Supplier {
+  id            BigInt       @id @default(autoincrement())
+  tenantId      BigInt       @map("tenant_id")
+  supplierCode  String?      @unique @map("supplier_code") @db.VarChar(50)
+  supplierName  String       @map("supplier_name") @db.VarChar(255)
+  contactPerson String?      @map("contact_person") @db.VarChar(150)
+  phone         String?      @db.VarChar(20)
+  email         String?      @db.VarChar(150)
+  address       String?      @db.Text
+  gstNumber     String?      @map("gst_number") @db.VarChar(50)
+  status        ActiveStatus @default(Active)
+  createdAt     DateTime     @default(now()) @map("created_at")
+  updatedAt     DateTime     @updatedAt @map("updated_at")
+  deletedAt     DateTime?    @map("deleted_at")
+
+  tenant  Tenant            @relation(fields: [tenantId], references: [id])
+  batches MedicineBatch[]
+  purchaseOrders PurchaseOrder[]
+
+  @@index([tenantId])
+  @@map("suppliers")
+}
+
+model MedicineCategory {
+  id           BigInt   @id @default(autoincrement())
+  tenantId     BigInt   @map("tenant_id")
+  categoryName String?  @map("category_name") @db.VarChar(150)
+  description  String?  @db.Text
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id])
+  medicines Medicine[]
+
+  @@index([tenantId])
+  @@map("medicine_categories")
+}
+
+model Medicine {
+  id             BigInt    @id @default(autoincrement())
+  tenantId       BigInt    @map("tenant_id")
+  categoryId     BigInt?   @map("category_id")
+  medicineCode   String?   @unique @map("medicine_code") @db.VarChar(50)
+  medicineName   String    @map("medicine_name") @db.VarChar(255)
+  genericName    String?   @map("generic_name") @db.VarChar(255)
+  manufacturer   String?   @db.VarChar(255)
+  unit           String?   @db.VarChar(50)
+  reorderLevel   Int       @default(10) @map("reorder_level")
+  gstPercentage  Decimal?  @map("gst_percentage") @db.Decimal(5, 2)
+  isActive       Boolean   @default(true) @map("is_active")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+  deletedAt      DateTime? @map("deleted_at")
+
+  tenant             Tenant              @relation(fields: [tenantId], references: [id])
+  category           MedicineCategory?   @relation(fields: [categoryId], references: [id])
+  batches            MedicineBatch[]
+  prescriptionItems  PrescriptionItem[]
+  saleItems          PharmacySaleItem[]
+
+  @@index([tenantId])
+  @@index([medicineName])
+  @@index([medicineCode])
+  @@map("medicines")
+}
+
+model MedicineBatch {
+  id                 BigInt    @id @default(autoincrement())
+  medicineId         BigInt    @map("medicine_id")
+  supplierId         BigInt?   @map("supplier_id")
+  batchNumber        String?   @map("batch_number") @db.VarChar(100)
+  manufacturingDate  DateTime? @map("manufacturing_date") @db.Date
+  expiryDate         DateTime? @map("expiry_date") @db.Date
+  purchasePrice      Decimal?  @map("purchase_price") @db.Decimal(10, 2)
+  sellingPrice       Decimal?  @map("selling_price") @db.Decimal(10, 2)
+  quantity           Int       @default(0)
+  availableQuantity  Int       @default(0) @map("available_quantity")
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
+
+  medicine  Medicine            @relation(fields: [medicineId], references: [id])
+  supplier  Supplier?           @relation(fields: [supplierId], references: [id])
+  saleItems PharmacySaleItem[]
+
+  @@index([medicineId])
+  @@index([expiryDate])
+  @@index([supplierId])
+  @@map("medicine_batches")
+}
+
+enum PharmacySaleStatus {
+  Completed
+  Cancelled
+  Returned
+}
+
+model PharmacySale {
+  id              BigInt              @id @default(autoincrement())
+  tenantId        BigInt              @map("tenant_id")
+  patientId       BigInt?             @map("patient_id")
+  prescriptionId  BigInt?             @map("prescription_id")
+  invoiceNumber   String              @unique @map("invoice_number") @db.VarChar(100)
+  totalAmount     Decimal             @default(0) @map("total_amount") @db.Decimal(12, 2)
+  discountAmount  Decimal             @default(0) @map("discount_amount") @db.Decimal(12, 2)
+  taxAmount       Decimal             @default(0) @map("tax_amount") @db.Decimal(12, 2)
+  netAmount       Decimal             @default(0) @map("net_amount") @db.Decimal(12, 2)
+  saleDate        DateTime            @default(now()) @map("sale_date")
+  status          PharmacySaleStatus  @default(Completed)
+  createdAt       DateTime            @default(now()) @map("created_at")
+  updatedAt       DateTime            @updatedAt @map("updated_at")
+  deletedAt       DateTime?           @map("deleted_at")
+
+  tenant       Tenant              @relation(fields: [tenantId], references: [id])
+  patient      Patient?            @relation(fields: [patientId], references: [id])
+  prescription Prescription?       @relation(fields: [prescriptionId], references: [id])
+  items        PharmacySaleItem[]
+
+  @@index([tenantId])
+  @@index([patientId])
+  @@index([prescriptionId])
+  @@index([saleDate])
+  @@map("pharmacy_sales")
+}
+
+model PharmacySaleItem {
+  id              BigInt   @id @default(autoincrement())
+  saleId          BigInt   @map("sale_id")
+  medicineId      BigInt   @map("medicine_id")
+  batchId         BigInt   @map("batch_id")
+  quantity        Int
+  unitPrice       Decimal  @map("unit_price") @db.Decimal(10, 2)
+  discountAmount  Decimal  @default(0) @map("discount_amount") @db.Decimal(10, 2)
+  totalAmount     Decimal  @map("total_amount") @db.Decimal(12, 2)
+
+  sale     PharmacySale  @relation(fields: [saleId], references: [id])
+  medicine Medicine      @relation(fields: [medicineId], references: [id])
+  batch    MedicineBatch @relation(fields: [batchId], references: [id])
+
+  @@index([saleId])
+  @@index([medicineId])
+  @@index([batchId])
+  @@map("pharmacy_sale_items")
+}
+
+// LABORATORY
+
+model LabCategory {
+  id           BigInt   @id @default(autoincrement())
+  tenantId     BigInt   @map("tenant_id")
+  categoryName String   @map("category_name") @db.VarChar(150)
+  description  String?  @db.Text
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant     @relation(fields: [tenantId], references: [id])
+  tests  LabTest[]
+
+  @@index([tenantId])
+  @@map("lab_categories")
+}
+
+model LabTest {
+  id              BigInt       @id @default(autoincrement())
+  tenantId        BigInt       @map("tenant_id")
+  categoryId      BigInt?      @map("category_id")
+  testCode        String?      @unique @map("test_code") @db.VarChar(50)
+  testName        String       @map("test_name") @db.VarChar(255)
+  sampleType      String?      @map("sample_type") @db.VarChar(100)
+  price           Decimal?     @db.Decimal(10, 2)
+  turnaroundHours Int?         @map("turnaround_hours")
+  status          ActiveStatus @default(Active)
+  createdAt       DateTime     @default(now()) @map("created_at")
+  updatedAt       DateTime     @updatedAt @map("updated_at")
+  deletedAt       DateTime?    @map("deleted_at")
+
+  tenant     Tenant        @relation(fields: [tenantId], references: [id])
+  category   LabCategory?  @relation(fields: [categoryId], references: [id])
+  orderItems LabOrderItem[]
+
+  @@index([tenantId])
+  @@index([categoryId])
+  @@map("lab_tests")
+}
+
+enum LabOrderPriority {
+  Routine
+  Urgent
+  STAT
+}
+
+enum LabOrderStatus {
+  Ordered
+  Collected
+  Processing
+  Completed
+  Cancelled
+}
+
+model LabOrder {
+  id          BigInt           @id @default(autoincrement())
+  tenantId    BigInt           @map("tenant_id")
+  patientId   BigInt           @map("patient_id")
+  doctorId    BigInt?          @map("doctor_id")
+  visitId     BigInt?          @map("visit_id")
+  orderNumber String           @unique @map("order_number") @db.VarChar(100)
+  orderDate   DateTime         @default(now()) @map("order_date")
+  priority    LabOrderPriority @default(Routine)
+  status      LabOrderStatus   @default(Ordered)
+  createdAt   DateTime         @default(now()) @map("created_at")
+  updatedAt   DateTime         @updatedAt @map("updated_at")
+  deletedAt   DateTime?        @map("deleted_at")
+
+  tenant  Tenant         @relation(fields: [tenantId], references: [id])
+  patient Patient        @relation(fields: [patientId], references: [id])
+  doctor  Doctor?        @relation(fields: [doctorId], references: [id])
+  visit   Visit?         @relation(fields: [visitId], references: [id])
+  items   LabOrderItem[]
+
+  @@index([tenantId])
+  @@index([patientId])
+  @@index([doctorId])
+  @@index([status])
+  @@map("lab_orders")
+}
+
+model LabOrderItem {
+  id         BigInt    @id @default(autoincrement())
+  labOrderId BigInt    @map("lab_order_id")
+  testId     BigInt    @map("test_id")
+  price      Decimal?  @db.Decimal(10, 2)
+  status     String?   @default("Pending") @db.VarChar(50)
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+
+  labOrder LabOrder    @relation(fields: [labOrderId], references: [id])
+  test     LabTest     @relation(fields: [testId], references: [id])
+  result   LabResult?
+
+  @@index([labOrderId])
+  @@index([testId])
+  @@map("lab_order_items")
+}
+
+model LabResult {
+  id              BigInt    @id @default(autoincrement())
+  labOrderItemId  BigInt    @unique @map("lab_order_item_id")
+  resultValue     String?   @map("result_value") @db.VarChar(255)
+  referenceRange  String?   @map("reference_range") @db.VarChar(255)
+  remarks         String?   @db.Text
+  verifiedBy      BigInt?   @map("verified_by")
+  verifiedAt      DateTime? @map("verified_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  labOrderItem LabOrderItem @relation(fields: [labOrderItemId], references: [id])
+
+  @@map("lab_results")
+}
+
+// RADIOLOGY
+
+model RadiologyService {
+  id          BigInt    @id @default(autoincrement())
+  tenantId    BigInt    @map("tenant_id")
+  serviceName String    @map("service_name") @db.VarChar(255)
+  serviceCode String?   @map("service_code") @db.VarChar(100)
+  price       Decimal?  @db.Decimal(10, 2)
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  tenant Tenant                @relation(fields: [tenantId], references: [id])
+  items  RadiologyOrderItem[]
+
+  @@index([tenantId])
+  @@map("radiology_services")
+}
+
+enum RadiologyOrderStatus {
+  Ordered
+  Scheduled
+  Completed
+  Cancelled
+}
+
+model RadiologyOrder {
+  id          BigInt                @id @default(autoincrement())
+  tenantId    BigInt                @map("tenant_id")
+  patientId   BigInt                @map("patient_id")
+  doctorId    BigInt?               @map("doctor_id")
+  visitId     BigInt?               @map("visit_id")
+  orderNumber String                @unique @map("order_number") @db.VarChar(100)
+  status      RadiologyOrderStatus  @default(Ordered)
+  orderedAt   DateTime              @default(now()) @map("ordered_at")
+  createdAt   DateTime              @default(now()) @map("created_at")
+  updatedAt   DateTime              @updatedAt @map("updated_at")
+  deletedAt   DateTime?             @map("deleted_at")
+
+  tenant  Tenant               @relation(fields: [tenantId], references: [id])
+  patient Patient              @relation(fields: [patientId], references: [id])
+  doctor  Doctor?              @relation(fields: [doctorId], references: [id])
+  visit   Visit?               @relation(fields: [visitId], references: [id])
+  items   RadiologyOrderItem[]
+  report  RadiologyReport?
+
+  @@index([tenantId])
+  @@index([patientId])
+  @@index([status])
+  @@map("radiology_orders")
+}
+
+model RadiologyOrderItem {
+  id               BigInt   @id @default(autoincrement())
+  radiologyOrderId BigInt   @map("radiology_order_id")
+  serviceId        BigInt   @map("service_id")
+  price            Decimal? @db.Decimal(10, 2)
+  status           String?  @default("Pending") @db.VarChar(50)
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  radiologyOrder RadiologyOrder   @relation(fields: [radiologyOrderId], references: [id])
+  service        RadiologyService @relation(fields: [serviceId], references: [id])
+
+  @@index([radiologyOrderId])
+  @@index([serviceId])
+  @@map("radiology_order_items")
+}
+
+enum RadiologyReportStatus {
+  Draft
+  Verified
+  Final
+}
+
+model RadiologyReport {
+  id               BigInt                 @id @default(autoincrement())
+  radiologyOrderId BigInt                 @unique @map("radiology_order_id")
+  findings         String?                @db.Text
+  impression       String?                @db.Text
+  reportStatus     RadiologyReportStatus  @default(Draft) @map("report_status")
+  images           Json?
+  reportedBy       BigInt?                @map("reported_by")
+  reportedAt       DateTime?              @map("reported_at")
+  createdAt        DateTime               @default(now()) @map("created_at")
+  updatedAt        DateTime               @updatedAt @map("updated_at")
+
+  radiologyOrder RadiologyOrder @relation(fields: [radiologyOrderId], references: [id])
+
+  @@map("radiology_reports")
+}
+
+// BILLING & PAYMENTS
+
+model BillingCategory {
+  id           BigInt   @id @default(autoincrement())
+  tenantId     BigInt   @map("tenant_id")
+  categoryName String   @map("category_name") @db.VarChar(150)
+  description  String?  @db.Text
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant      @relation(fields: [tenantId], references: [id])
+  items  BillItem[]
+
+  @@index([tenantId])
+  @@map("billing_categories")
+}
+
+enum BillStatus {
+  Draft
+  PartiallyPaid
+  Paid
+  Cancelled
+}
+
+model Bill {
+  id              BigInt     @id @default(autoincrement())
+  tenantId        BigInt     @map("tenant_id")
+  patientId       BigInt     @map("patient_id")
+  billNumber      String     @unique @map("bill_number") @db.VarChar(100)
+  billDate        DateTime   @default(now()) @map("bill_date")
+  subtotal        Decimal    @default(0) @db.Decimal(12, 2)
+  discountAmount  Decimal    @default(0) @map("discount_amount") @db.Decimal(12, 2)
+  taxAmount       Decimal    @default(0) @map("tax_amount") @db.Decimal(12, 2)
+  totalAmount     Decimal    @default(0) @map("total_amount") @db.Decimal(12, 2)
+  paidAmount      Decimal    @default(0) @map("paid_amount") @db.Decimal(12, 2)
+  dueAmount       Decimal    @default(0) @map("due_amount") @db.Decimal(12, 2)
+  status          BillStatus @default(Draft)
+  createdAt       DateTime   @default(now()) @map("created_at")
+  updatedAt       DateTime   @updatedAt @map("updated_at")
+  deletedAt       DateTime?  @map("deleted_at")
+
+  tenant   Tenant      @relation(fields: [tenantId], references: [id])
+  patient  Patient     @relation(fields: [patientId], references: [id])
+  items    BillItem[]
+  payments Payment[]
+
+  @@index([tenantId])
+  @@index([patientId])
+  @@index([billNumber])
+  @@index([status])
+  @@index([billDate])
+  paymentSplits PaymentSplit[]
+
+  @@map("bills")
+}
+
+model BillItem {
+  id             BigInt   @id @default(autoincrement())
+  billId         BigInt   @map("bill_id")
+  categoryId     BigInt?  @map("category_id")
+  serviceName    String?  @map("service_name") @db.VarChar(255)
+  quantity       Int      @default(1)
+  unitPrice      Decimal  @map("unit_price") @db.Decimal(10, 2)
+  discountAmount Decimal  @default(0) @map("discount_amount") @db.Decimal(10, 2)
+  taxAmount      Decimal  @default(0) @map("tax_amount") @db.Decimal(10, 2)
+  totalAmount    Decimal  @map("total_amount") @db.Decimal(12, 2)
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  bill     Bill             @relation(fields: [billId], references: [id])
+  category BillingCategory? @relation(fields: [categoryId], references: [id])
+
+  @@index([billId])
+  @@map("bill_items")
+}
+
+enum PaymentMethod {
+  Cash
+  Card
+  UPI
+  NetBanking
+  Insurance
+}
+
+enum PaymentStatus {
+  Pending
+  Success
+  Failed
+  Refunded
+}
+
+model Payment {
+  id                BigInt        @id @default(autoincrement())
+  tenantId          BigInt        @map("tenant_id")
+  billId            BigInt        @map("bill_id")
+  paymentReference  String?       @map("payment_reference") @db.VarChar(255)
+  amount            Decimal       @db.Decimal(12, 2)
+  paymentMethod     PaymentMethod @map("payment_method")
+  transactionId     String?       @map("transaction_id") @db.VarChar(255)
+  paymentDate       DateTime      @default(now()) @map("payment_date")
+  status            PaymentStatus @default(Pending)
+  createdAt         DateTime      @default(now()) @map("created_at")
+  updatedAt         DateTime      @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  bill   Bill   @relation(fields: [billId], references: [id])
+
+  @@index([tenantId])
+  @@index([billId])
+  @@index([status])
+  @@index([paymentDate])
+  @@map("payments")
+}
+
+// HUMAN RESOURCES
+
+model Designation {
+  id              BigInt       @id @default(autoincrement())
+  tenantId        BigInt       @map("tenant_id")
+  designationName String       @map("designation_name") @db.VarChar(150)
+  description     String?      @db.Text
+  status          ActiveStatus @default(Active)
+  createdAt       DateTime     @default(now()) @map("created_at")
+  updatedAt       DateTime     @updatedAt @map("updated_at")
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id])
+  employees Employee[]
+
+  @@index([tenantId])
+  @@map("designations")
+}
+
+enum EmploymentType {
+  Permanent
+  Contract
+  PartTime
+}
+
+enum EmployeeStatus {
+  Active
+  Inactive
+  Resigned
+}
+
+model Employee {
+  id              BigInt          @id @default(autoincrement())
+  tenantId        BigInt          @map("tenant_id")
+  userId          BigInt?         @unique @map("user_id")
+  employeeCode    String          @unique @map("employee_code") @db.VarChar(50)
+  firstName       String          @map("first_name") @db.VarChar(100)
+  lastName        String?         @map("last_name") @db.VarChar(100)
+  gender          Gender?
+  dob             DateTime?       @db.Date
+  phone           String?         @db.VarChar(20)
+  email           String?         @db.VarChar(150)
+  address         String?         @db.Text
+  departmentId    BigInt?         @map("department_id")
+  designationId   BigInt?         @map("designation_id")
+  joiningDate     DateTime?       @map("joining_date") @db.Date
+  employmentType  EmploymentType? @map("employment_type")
+  basicSalary     Decimal?        @map("basic_salary") @db.Decimal(12, 2)
+  status          EmployeeStatus  @default(Active)
+  createdAt       DateTime        @default(now()) @map("created_at")
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  deletedAt       DateTime?       @map("deleted_at")
+
+  tenant      Tenant       @relation(fields: [tenantId], references: [id])
+  department  Department?  @relation(fields: [departmentId], references: [id])
+  designation Designation? @relation(fields: [designationId], references: [id])
+  user        User?        @relation(fields: [userId], references: [id])
+  attendance  Attendance[]
+  leaveApplications LeaveApplication[]
+  payrolls    Payroll[]
+  shiftAssignments ShiftAssignment[]
+  incentiveEntries IncentiveEntry[]
+  loans        EmployeeLoan[]
+  performanceReviews PerformanceReview[]
+  overtimeRecords   OvertimeRecord[]
+  statutoryRegisters StatutoryRegister[]
+  employeeDocuments EmployeeDocument[]
+  biometricLogs     BiometricLog[]
+
+  @@index([tenantId])
+  @@index([departmentId])
+  @@index([status])
+  @@map("employees")
+}
+
+enum DocumentReviewStatus {
+  Pending
+  Verified
+  Rejected
+}
+
+model EmployeeDocument {
+  id         BigInt                @id @default(autoincrement())
+  tenantId   BigInt                @map("tenant_id")
+  employeeId BigInt                @map("employee_id")
+  type       String                @db.VarChar(100)
+  number     String?               @db.VarChar(100)
+  expiryDate DateTime?             @map("expiry_date") @db.Date
+  fileUrl    String?               @map("file_url") @db.Text
+  notes      String?               @db.Text
+  status     DocumentReviewStatus  @default(Pending)
+  verifiedBy BigInt?               @map("verified_by")
+  verifiedAt DateTime?             @map("verified_at")
+  createdAt  DateTime              @default(now()) @map("created_at")
+  updatedAt  DateTime              @updatedAt @map("updated_at")
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id])
+  employee Employee @relation(fields: [employeeId], references: [id])
+
+  @@index([tenantId])
+  @@index([employeeId])
+  @@index([status])
+  @@map("employee_documents")
+}
+
+enum BiometricDeviceStatus {
+  Online
+  Offline
+  Error
+  Syncing
+}
+
+model BiometricDevice {
+  id           BigInt                @id @default(autoincrement())
+  tenantId     BigInt                @map("tenant_id")
+  name         String                @db.VarChar(150)
+  deviceType   String                @map("device_type") @db.VarChar(50)
+  location     String?               @db.VarChar(150)
+  ipAddress    String?               @map("ip_address") @db.VarChar(50)
+  serialNumber String?               @map("serial_number") @db.VarChar(100)
+  status       BiometricDeviceStatus @default(Offline)
+  lastSyncAt   DateTime?             @map("last_sync_at")
+  createdAt    DateTime              @default(now()) @map("created_at")
+  updatedAt    DateTime              @updatedAt @map("updated_at")
+
+  tenant Tenant         @relation(fields: [tenantId], references: [id])
+  logs   BiometricLog[]
+
+  @@index([tenantId])
+  @@map("biometric_devices")
+}
+
+model BiometricLog {
+  id         BigInt   @id @default(autoincrement())
+  tenantId   BigInt   @map("tenant_id")
+  deviceId   BigInt   @map("device_id")
+  employeeId BigInt?  @map("employee_id")
+  punchType  String   @map("punch_type") @db.VarChar(20)
+  punchTime  DateTime @map("punch_time")
+  rawUserId  String?  @map("raw_user_id") @db.VarChar(100)
+  synced     Boolean  @default(true)
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  tenant   Tenant           @relation(fields: [tenantId], references: [id])
+  device   BiometricDevice  @relation(fields: [deviceId], references: [id])
+  employee Employee?        @relation(fields: [employeeId], references: [id])
+
+  @@index([tenantId])
+  @@index([deviceId])
+  @@index([employeeId])
+  @@map("biometric_logs")
+}
+
+model MobileAppConfig {
+  id              BigInt   @id @default(autoincrement())
+  tenantId        BigInt   @unique @map("tenant_id")
+  appName         String?  @map("app_name") @db.VarChar(150)
+  primaryColor    String?  @map("primary_color") @db.VarChar(20)
+  featuresEnabled Json?    @map("features_enabled")
+  isLive          Boolean  @default(false) @map("is_live")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@map("mobile_app_configs")
+}
+
+model MobileAppRegistration {
+  id           BigInt    @id @default(autoincrement())
+  tenantId     BigInt    @map("tenant_id")
+  patientId    BigInt    @map("patient_id")
+  deviceToken  String?   @map("device_token") @db.VarChar(255)
+  platform     String?   @db.VarChar(20)
+  registeredAt DateTime  @default(now()) @map("registered_at")
+  lastActiveAt DateTime? @map("last_active_at")
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id])
+  patient Patient @relation(fields: [patientId], references: [id])
+
+  @@index([tenantId])
+  @@index([patientId])
+  @@map("mobile_app_registrations")
+}
+
+model VoiceNote {
+  id        BigInt   @id @default(autoincrement())
+  tenantId  BigInt   @map("tenant_id")
+  title     String   @db.VarChar(200)
+  type      String   @db.VarChar(50)
+  text      String   @db.Text
+  patientId BigInt?  @map("patient_id")
+  createdBy BigInt?  @map("created_by")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant  Tenant   @relation(fields: [tenantId], references: [id])
+  patient Patient? @relation(fields: [patientId], references: [id])
+  author  User?    @relation(fields: [createdBy], references: [id])
+
+  @@index([tenantId])
+  @@index([patientId])
+  @@map("voice_notes")
+}
+
+enum AttendanceStatus {
+  Present
+  Absent
+  HalfDay
+  Leave
+}
+
+enum AttendanceSource {
+  Web
+  Mobile
+  Biometric
+}
+
+model Attendance {
+  id              BigInt            @id @default(autoincrement())
+  employeeId      BigInt            @map("employee_id")
+  attendanceDate  DateTime          @map("attendance_date") @db.Date
+  checkInTime     DateTime?         @map("check_in_time")
+  checkOutTime    DateTime?         @map("check_out_time")
+  workHours       Decimal?          @map("work_hours") @db.Decimal(5, 2)
+  status          AttendanceStatus  @default(Present)
+  source          AttendanceSource  @default(Web)
+  checkInLat      Decimal?          @map("check_in_lat") @db.Decimal(10, 7)
+  checkInLng      Decimal?          @map("check_in_lng") @db.Decimal(10, 7)
+  checkInAddress  String?           @map("check_in_address") @db.VarChar(255)
+  checkOutLat     Decimal?          @map("check_out_lat") @db.Decimal(10, 7)
+  checkOutLng     Decimal?          @map("check_out_lng") @db.Decimal(10, 7)
+  withinGeofence  Boolean?          @map("within_geofence")
+  createdAt       DateTime          @default(now()) @map("created_at")
+  updatedAt       DateTime          @updatedAt @map("updated_at")
+
+  employee Employee @relation(fields: [employeeId], references: [id])
+
+  @@index([employeeId])
+  @@index([attendanceDate])
+  @@map("attendance")
+}
+
+model LeaveType {
+  id           BigInt   @id @default(autoincrement())
+  tenantId     BigInt   @map("tenant_id")
+  leaveName    String?  @map("leave_name") @db.VarChar(100)
+  annualQuota  Int?     @map("annual_quota")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  tenant       Tenant             @relation(fields: [tenantId], references: [id])
+  applications LeaveApplication[]
+
+  @@map("leave_types")
+}
+
+enum LeaveStatus {
+  Pending
+  Approved
+  Rejected
+}
+
+model LeaveApplication {
+  id           BigInt      @id @default(autoincrement())
+  employeeId   BigInt      @map("employee_id")
+  leaveTypeId  BigInt      @map("leave_type_id")
+  fromDate     DateTime    @map("from_date") @db.Date
+  toDate       DateTime    @map("to_date") @db.Date
+  totalDays    Int?        @map("total_days")
+  reason       String?     @db.Text
+  status       LeaveStatus @default(Pending)
+  approvedBy   BigInt?     @map("approved_by")
+  createdAt    DateTime    @default(now()) @map("created_at")
+  updatedAt    DateTime    @updatedAt @map("updated_at")
+
+  employee  Employee  @relation(fields: [employeeId], references: [id])
+  leaveType LeaveType @relation(fields: [leaveTypeId], references: [id])
+
+  @@index([employeeId])
+  @@index([status])
+  @@map("leave_applications")
+}
+
+enum PayrollPaymentStatus {
+  Pending
+  Paid
+}
+
+model Payroll {
+  id              BigInt                @id @default(autoincrement())
+  employeeId      BigInt                @map("employee_id")
+  payrollMonth    Int                   @map("payroll_month")
+  payrollYear     Int                   @map("payroll_year")
+  basicSalary     Decimal               @map("basic_salary") @db.Decimal(12, 2)
+  allowances      Decimal               @default(0) @db.Decimal(12, 2)
+  overtimeAmount  Decimal               @default(0) @map("overtime_amount") @db.Decimal(12, 2)
+  deductions      Decimal               @default(0) @db.Decimal(12, 2)
+  taxAmount       Decimal               @default(0) @map("tax_amount") @db.Decimal(12, 2)
+  netSalary       Decimal               @map("net_salary") @db.Decimal(12, 2)
+  paymentStatus   PayrollPaymentStatus  @default(Pending) @map("payment_status")
+  paymentDate     DateTime?             @map("payment_date") @db.Date
+  createdAt       DateTime              @default(now()) @map("created_at")
+  updatedAt       DateTime              @updatedAt @map("updated_at")
+
+  employee Employee @relation(fields: [employeeId], references: [id])
+
+  @@index([employeeId])
+  @@index([payrollYear, payrollMonth])
+  @@map("payroll")
+}
+
+// NOTIFICATIONS & FILES
+
+enum NotificationType {
+  System
+  Appointment
+  Billing
+  Lab
+  Emergency
+}
+
+model Notification {
+  id               BigInt           @id @default(autoincrement())
+  tenantId         BigInt           @map("tenant_id")
+  userId           BigInt           @map("user_id")
+  title            String?          @db.VarChar(255)
+  message          String?          @db.Text
+  notificationType NotificationType @default(System) @map("notification_type")
+  isRead           Boolean          @default(false) @map("is_read")
+  createdAt        DateTime         @default(now()) @map("created_at")
+  updatedAt        DateTime         @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  user   User   @relation(fields: [userId], references: [id])
+
+  @@index([tenantId])
+  @@index([userId])
+  @@index([isRead])
+  @@map("notifications")
+}
+
+enum StorageProvider {
+  Local
+  AWS_S3
+  Azure
+  GCP
+}
+
+model File {
+  id               BigInt           @id @default(autoincrement())
+  tenantId         BigInt           @map("tenant_id")
+  patientId        BigInt?          @map("patient_id")
+  uploadedBy       BigInt?          @map("uploaded_by")
+  fileName         String?          @map("file_name") @db.VarChar(255)
+  fileType         String?          @map("file_type") @db.VarChar(100)
+  fileSize         BigInt?          @map("file_size")
+  storageProvider  StorageProvider  @default(Local) @map("storage_provider")
+  fileUrl          String?          @map("file_url") @db.Text
+  createdAt        DateTime         @default(now()) @map("created_at")
+
+  uploader User? @relation(fields: [uploadedBy], references: [id])
+
+  @@index([tenantId])
+  @@index([patientId])
+  @@map("files")
+}
+
+// EMERGENCY & TRIAGE
+
+enum EmergencySeverity {
+  Low
+  Medium
+  High
+  Critical
+}
+
+enum EmergencyStatus {
+  Waiting
+  InTreatment
+  Admitted
+  Discharged
+}
+
+model EmergencyCase {
+  id               BigInt            @id @default(autoincrement())
+  tenantId         BigInt            @map("tenant_id")
+  patientId        BigInt            @map("patient_id")
+  arrivalTime      DateTime          @default(now()) @map("arrival_time")
+  severity         EmergencySeverity
+  chiefComplaint   String?           @map("chief_complaint") @db.Text
+  assignedDoctorId BigInt?           @map("assigned_doctor_id")
+  status           EmergencyStatus   @default(Waiting)
+  createdAt        DateTime          @default(now()) @map("created_at")
+  updatedAt        DateTime          @updatedAt @map("updated_at")
+
+  tenant         Tenant         @relation(fields: [tenantId], references: [id])
+  patient        Patient        @relation(fields: [patientId], references: [id])
+  assignedDoctor Doctor?        @relation(fields: [assignedDoctorId], references: [id])
+  triageRecords  TriageRecord[]
+
+  @@index([tenantId])
+  @@index([patientId])
+  @@index([status])
+  @@map("emergency_cases")
+}
+
+model TriageRecord {
+  id              BigInt   @id @default(autoincrement())
+  emergencyCaseId BigInt   @map("emergency_case_id")
+  bloodPressure   String?  @map("blood_pressure") @db.VarChar(50)
+  pulseRate       Int?     @map("pulse_rate")
+  temperature     Decimal? @db.Decimal(5, 2)
+  respiratoryRate Int?     @map("respiratory_rate")
+  oxygenSaturation Decimal? @map("oxygen_saturation") @db.Decimal(5, 2)
+  notes           String?  @db.Text
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  emergencyCase EmergencyCase @relation(fields: [emergencyCaseId], references: [id])
+
+  @@index([emergencyCaseId])
+  @@map("triage_records")
+}
+
+
+enum OTStatus {
+  Scheduled
+  InProgress
+  Completed
+  Cancelled
+  Postponed
+}
+
+enum AnesthesiaType {
+  General
+  Local
+  Regional
+  Spinal
+  Epidural
+}
+
+model OTRoom {
+  id          BigInt   @id @default(autoincrement())
+  tenantId    BigInt   @map("tenant_id")
+  name        String   @db.VarChar(100)
+  roomNumber  String   @map("room_number") @db.VarChar(20)
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  tenant    Tenant      @relation(fields: [tenantId], references: [id])
+  schedules OTSchedule[]
+
+  @@index([tenantId])
+  @@map("ot_rooms")
+}
+
+model OTSchedule {
+  id              BigInt         @id @default(autoincrement())
+  tenantId        BigInt         @map("tenant_id")
+  patientId       BigInt         @map("patient_id")
+  doctorId        BigInt         @map("doctor_id")
+  admissionId     BigInt?        @map("admission_id")
+  otRoomId        BigInt?        @map("ot_room_id")
+  surgeryName     String         @map("surgery_name") @db.VarChar(255)
+  icdCode         String?        @map("icd_code") @db.VarChar(50)
+  scheduledDate   DateTime       @map("scheduled_date") @db.Date
+  startTime       DateTime?      @map("start_time")
+  endTime         DateTime?      @map("end_time")
+  durationMinutes Int?           @map("duration_minutes")
+  anesthesiaType  AnesthesiaType? @map("anesthesia_type")
+  anesthetistId   BigInt?        @map("anesthetist_id")
+  assistantIds    Json?          @map("assistant_ids")
+  status          OTStatus       @default(Scheduled)
+  preOpNotes      String?        @map("pre_op_notes") @db.Text
+  postOpNotes     String?        @map("post_op_notes") @db.Text
+  complications   String?        @db.Text
+  createdAt       DateTime       @default(now()) @map("created_at")
+  updatedAt       DateTime       @updatedAt @map("updated_at")
+
+  tenant    Tenant    @relation(fields: [tenantId], references: [id])
+  patient   Patient   @relation(fields: [patientId], references: [id])
+  doctor    Doctor    @relation(fields: [doctorId], references: [id])
+  otRoom    OTRoom?   @relation(fields: [otRoomId], references: [id])
+
+  @@index([tenantId])
+  @@index([patientId])
+  @@index([doctorId])
+  @@index([scheduledDate])
+  @@map("ot_schedules")
+}
+
+
+enum ClaimStatus {
+  Draft
+  Submitted
+  UnderReview
+  Approved
+  Rejected
+  Settled
+  PartiallyApproved
+}
+
+model InsurancePayer {
+  id          BigInt   @id @default(autoincrement())
+  tenantId    BigInt   @map("tenant_id")
+  name        String   @db.VarChar(255)
+  code        String?  @db.VarChar(50)
+  type        String?  @db.VarChar(50)
+  contactName String?  @map("contact_name") @db.VarChar(150)
+  phone       String?  @db.VarChar(20)
+  email       String?  @db.VarChar(150)
+  address     String?  @db.Text
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant          @relation(fields: [tenantId], references: [id])
+  claims InsuranceClaim[]
+
+  @@index([tenantId])
+  @@map("insurance_payers")
+}
+
+model InsuranceClaim {
+  id             BigInt      @id @default(autoincrement())
+  tenantId       BigInt      @map("tenant_id")
+  payerId        BigInt      @map("payer_id")
+  patientId      BigInt      @map("patient_id")
+  billId         BigInt?     @map("bill_id")
+  admissionId    BigInt?     @map("admission_id")
+  claimNumber    String?     @unique @map("claim_number") @db.VarChar(100)
+  policyNumber   String?     @map("policy_number") @db.VarChar(100)
+  policyHolder   String?     @map("policy_holder") @db.VarChar(255)
+  claimedAmount  Decimal     @map("claimed_amount") @db.Decimal(12, 2)
+  approvedAmount Decimal     @default(0) @map("approved_amount") @db.Decimal(12, 2)
+  settledAmount  Decimal     @default(0) @map("settled_amount") @db.Decimal(12, 2)
+  status         ClaimStatus @default(Draft)
+  submittedAt    DateTime?   @map("submitted_at")
+  settledAt      DateTime?   @map("settled_at")
+  rejectionReason String?   @map("rejection_reason") @db.Text
+  notes          String?     @db.Text
+  createdAt      DateTime    @default(now()) @map("created_at")
+  updatedAt      DateTime    @updatedAt @map("updated_at")
+
+  tenant  Tenant         @relation(fields: [tenantId], references: [id])
+  payer   InsurancePayer @relation(fields: [payerId], references: [id])
+  patient Patient        @relation(fields: [patientId], references: [id])
+
+  @@index([tenantId])
+  @@index([patientId])
+  @@index([status])
+  @@map("insurance_claims")
+}
+
+
+enum BloodGroup {
+  APositive   @map("A+")
+  ANegative   @map("A-")
+  BPositive   @map("B+")
+  BNegative   @map("B-")
+  ABPositive  @map("AB+")
+  ABNegative  @map("AB-")
+  OPositive   @map("O+")
+  ONegative   @map("O-")
+}
+
+enum BloodUnitStatus {
+  Available
+  Reserved
+  Issued
+  Expired
+  Discarded
+}
+
+enum DonorStatus {
+  Active
+  Deferred
+  Inactive
+}
+
+model BloodDonor {
+  id          BigInt      @id @default(autoincrement())
+  tenantId    BigInt      @map("tenant_id")
+  donorCode   String      @unique @map("donor_code") @db.VarChar(50)
+  name        String      @db.VarChar(255)
+  gender      Gender?
+  dob         DateTime?   @db.Date
+  phone       String?     @db.VarChar(20)
+  email       String?     @db.VarChar(150)
+  bloodGroup  BloodGroup  @map("blood_group")
+  address     String?     @db.Text
+  lastDonatedAt DateTime? @map("last_donated_at") @db.Date
+  totalDonations Int      @default(0) @map("total_donations")
+  status      DonorStatus @default(Active)
+  createdAt   DateTime    @default(now()) @map("created_at")
+  updatedAt   DateTime    @updatedAt @map("updated_at")
+
+  tenant     Tenant      @relation(fields: [tenantId], references: [id])
+  bloodUnits BloodUnit[]
+
+  @@index([tenantId])
+  @@index([bloodGroup])
+  @@map("blood_donors")
+}
+
+model BloodUnit {
+  id           BigInt          @id @default(autoincrement())
+  tenantId     BigInt          @map("tenant_id")
+  donorId      BigInt?         @map("donor_id")
+  unitCode     String          @unique @map("unit_code") @db.VarChar(50)
+  bloodGroup   BloodGroup      @map("blood_group")
+  componentType String         @map("component_type") @db.VarChar(50)
+  volumeMl     Int             @map("volume_ml")
+  collectedAt  DateTime        @map("collected_at") @db.Date
+  expiresAt    DateTime        @map("expires_at") @db.Date
+  status       BloodUnitStatus @default(Available)
+  issuedTo     BigInt?         @map("issued_to")
+  issuedAt     DateTime?       @map("issued_at")
+  notes        String?         @db.Text
+  createdAt    DateTime        @default(now()) @map("created_at")
+  updatedAt    DateTime        @updatedAt @map("updated_at")
+
+  tenant Tenant      @relation(fields: [tenantId], references: [id])
+  donor  BloodDonor? @relation(fields: [donorId], references: [id])
+
+  @@index([tenantId])
+  @@index([bloodGroup, status])
+  @@map("blood_units")
+}
+
+
+enum MealType {
+  Breakfast
+  Lunch
+  Dinner
+  Snack
+}
+
+model DietPlan {
+  id            BigInt   @id @default(autoincrement())
+  tenantId      BigInt   @map("tenant_id")
+  name          String   @db.VarChar(255)
+  description   String?  @db.Text
+  dietType      String?  @map("diet_type") @db.VarChar(100)
+  calories      Int?
+  protein       Decimal? @db.Decimal(6, 2)
+  carbs         Decimal? @db.Decimal(6, 2)
+  fat           Decimal? @db.Decimal(6, 2)
+  restrictions  String?  @db.Text
+  isActive      Boolean  @default(true) @map("is_active")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  tenant       Tenant            @relation(fields: [tenantId], references: [id])
+  assignments  DietAssignment[]
+
+  @@index([tenantId])
+  @@map("diet_plans")
+}
+
+model DietAssignment {
+  id          BigInt    @id @default(autoincrement())
+  tenantId    BigInt    @map("tenant_id")
+  patientId   BigInt    @map("patient_id")
+  admissionId BigInt?   @map("admission_id")
+  dietPlanId  BigInt    @map("diet_plan_id")
+  startDate   DateTime  @map("start_date") @db.Date
+  endDate     DateTime? @map("end_date") @db.Date
+  mealType    MealType  @map("meal_type")
+  notes       String?   @db.Text
+  assignedBy  BigInt?   @map("assigned_by")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id])
+  patient  Patient  @relation(fields: [patientId], references: [id])
+  dietPlan DietPlan @relation(fields: [dietPlanId], references: [id])
+
+  @@index([tenantId])
+  @@index([patientId])
+  @@map("diet_assignments")
+}
+
+
+enum POStatus {
+  Draft
+  Sent
+  PartiallyReceived
+  Received
+  Cancelled
+}
+
+enum StockTransactionType {
+  Purchase
+  Issue
+  Return
+  Adjustment
+  Expired
+}
+
+model InventoryCategory {
+  id        BigInt   @id @default(autoincrement())
+  tenantId  BigInt   @map("tenant_id")
+  name      String   @db.VarChar(150)
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant Tenant      @relation(fields: [tenantId], references: [id])
+  items  InventoryItem[]
+
+  @@index([tenantId])
+  @@map("inventory_categories")
+}
+
+model InventoryItem {
+  id            BigInt   @id @default(autoincrement())
+  tenantId      BigInt   @map("tenant_id")
+  categoryId    BigInt?  @map("category_id")
+  itemCode      String   @unique @map("item_code") @db.VarChar(50)
+  name          String   @db.VarChar(255)
+  unit          String   @db.VarChar(50)
+  currentStock  Decimal  @default(0) @map("current_stock") @db.Decimal(12, 2)
+  minStockLevel Decimal  @default(0) @map("min_stock_level") @db.Decimal(12, 2)
+  unitPrice     Decimal  @default(0) @map("unit_price") @db.Decimal(12, 2)
+  location      String?  @db.VarChar(150)
+  isActive      Boolean  @default(true) @map("is_active")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  tenant           Tenant              @relation(fields: [tenantId], references: [id])
+  category         InventoryCategory?  @relation(fields: [categoryId], references: [id])
+  purchaseOrderItems PurchaseOrderItem[]
+  transactions     StockTransaction[]
+
+  @@index([tenantId])
+  @@map("inventory_items")
+}
+
+model PurchaseOrder {
+  id           BigInt   @id @default(autoincrement())
+  tenantId     BigInt   @map("tenant_id")
+  supplierId   BigInt?  @map("supplier_id")
+  poNumber     String   @unique @map("po_number") @db.VarChar(50)
+  orderDate    DateTime @map("order_date") @db.Date
+  expectedDate DateTime? @map("expected_date") @db.Date
+  status       POStatus @default(Draft)
+  totalAmount  Decimal  @default(0) @map("total_amount") @db.Decimal(12, 2)
+  notes        String?  @db.Text
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  tenant   Tenant              @relation(fields: [tenantId], references: [id])
+  supplier Supplier?           @relation(fields: [supplierId], references: [id])
+  items    PurchaseOrderItem[]
+
+  @@index([tenantId])
+  @@map("purchase_orders")
+}
+
+model PurchaseOrderItem {
+  id              BigInt   @id @default(autoincrement())
+  purchaseOrderId BigInt   @map("purchase_order_id")
+  itemId          BigInt   @map("item_id")
+  orderedQty      Decimal  @map("ordered_qty") @db.Decimal(12, 2)
+  receivedQty     Decimal  @default(0) @map("received_qty") @db.Decimal(12, 2)
+  unitPrice       Decimal  @map("unit_price") @db.Decimal(12, 2)
+  totalPrice      Decimal  @map("total_price") @db.Decimal(12, 2)
+
+  purchaseOrder PurchaseOrder @relation(fields: [purchaseOrderId], references: [id])
+  item          InventoryItem @relation(fields: [itemId], references: [id])
+
+  @@index([purchaseOrderId])
+  @@map("purchase_order_items")
+}
+
+model StockTransaction {
+  id              BigInt               @id @default(autoincrement())
+  tenantId        BigInt               @map("tenant_id")
+  itemId          BigInt               @map("item_id")
+  transactionType StockTransactionType @map("transaction_type")
+  quantity        Decimal              @db.Decimal(12, 2)
+  unitPrice       Decimal?             @map("unit_price") @db.Decimal(12, 2)
+  referenceType   String?              @map("reference_type") @db.VarChar(50)
+  referenceId     BigInt?              @map("reference_id")
+  notes           String?              @db.Text
+  createdAt       DateTime             @default(now()) @map("created_at")
+  createdBy       BigInt?              @map("created_by")
+
+  tenant Tenant        @relation(fields: [tenantId], references: [id])
+  item   InventoryItem @relation(fields: [itemId], references: [id])
+
+  @@index([tenantId])
+  @@index([itemId])
+  @@map("stock_transactions")
+}
+
+
+model ShiftTemplate {
+  id          BigInt   @id @default(autoincrement())
+  tenantId    BigInt   @map("tenant_id")
+  name        String   @db.VarChar(100)
+  startTime   String   @map("start_time") @db.VarChar(8)
+  endTime     String   @map("end_time") @db.VarChar(8)
+  durationHrs Decimal  @map("duration_hrs") @db.Decimal(4, 2)
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  tenant      Tenant          @relation(fields: [tenantId], references: [id])
+  assignments ShiftAssignment[]
+
+  @@index([tenantId])
+  @@map("shift_templates")
+}
+
+model ShiftAssignment {
+  id          BigInt   @id @default(autoincrement())
+  tenantId    BigInt   @map("tenant_id")
+  employeeId  BigInt   @map("employee_id")
+  shiftId     BigInt   @map("shift_id")
+  assignedDate DateTime @map("assigned_date") @db.Date
+  notes       String?  @db.Text
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  tenant   Tenant        @relation(fields: [tenantId], references: [id])
+  employee Employee      @relation(fields: [employeeId], references: [id])
+  shift    ShiftTemplate @relation(fields: [shiftId], references: [id])
+
+  @@index([tenantId])
+  @@index([employeeId])
+  @@index([assignedDate])
+  @@map("shift_assignments")
+}
+
+
+model DoctorRevenueRule {
+  id             BigInt   @id @default(autoincrement())
+  tenantId       BigInt   @map("tenant_id")
+  doctorId       BigInt   @map("doctor_id")
+  revenueType    String   @map("revenue_type") @db.VarChar(50)
+  sharePercent   Decimal  @map("share_percent") @db.Decimal(5, 2)
+  fixedAmount    Decimal  @default(0) @map("fixed_amount") @db.Decimal(12, 2)
+  effectiveFrom  DateTime @map("effective_from") @db.Date
+  effectiveTo    DateTime? @map("effective_to") @db.Date
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  doctor Doctor @relation(fields: [doctorId], references: [id])
+
+  @@index([tenantId])
+  @@index([doctorId])
+  @@map("doctor_revenue_rules")
+}
+
+model DoctorRevenueEntry {
+  id           BigInt   @id @default(autoincrement())
+  tenantId     BigInt   @map("tenant_id")
+  doctorId     BigInt   @map("doctor_id")
+  ruleId       BigInt?  @map("rule_id")
+  billId       BigInt?  @map("bill_id")
+  revenueType  String   @map("revenue_type") @db.VarChar(50)
+  grossAmount  Decimal  @map("gross_amount") @db.Decimal(12, 2)
+  shareAmount  Decimal  @map("share_amount") @db.Decimal(12, 2)
+  entryDate    DateTime @map("entry_date") @db.Date
+  isPaid       Boolean  @default(false) @map("is_paid")
+  paidAt       DateTime? @map("paid_at")
+  notes        String?  @db.Text
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  doctor Doctor @relation(fields: [doctorId], references: [id])
+
+  @@index([tenantId])
+  @@index([doctorId])
+  @@map("doctor_revenue_entries")
+}
+
+
+model IncentiveRule {
+  id          BigInt   @id @default(autoincrement())
+  tenantId    BigInt   @map("tenant_id")
+  name        String   @db.VarChar(255)
+  targetType  String   @map("target_type") @db.VarChar(50)
+  targetValue Decimal  @map("target_value") @db.Decimal(12, 2)
+  incentiveAmount Decimal @map("incentive_amount") @db.Decimal(12, 2)
+  incentiveType String @map("incentive_type") @db.VarChar(20)
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  tenant      Tenant           @relation(fields: [tenantId], references: [id])
+  assignments IncentiveEntry[]
+
+  @@index([tenantId])
+  @@map("incentive_rules")
+}
+
+model IncentiveEntry {
+  id          BigInt   @id @default(autoincrement())
+  tenantId    BigInt   @map("tenant_id")
+  employeeId  BigInt   @map("employee_id")
+  ruleId      BigInt?  @map("rule_id")
+  month       Int
+  year        Int
+  amount      Decimal  @db.Decimal(12, 2)
+  reason      String?  @db.Text
+  isPaid      Boolean  @default(false) @map("is_paid")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  tenant   Tenant        @relation(fields: [tenantId], references: [id])
+  employee Employee      @relation(fields: [employeeId], references: [id])
+  rule     IncentiveRule? @relation(fields: [ruleId], references: [id])
+
+  @@index([tenantId])
+  @@index([employeeId])
+  @@map("incentive_entries")
+}
+
+
+model EmployeeLoan {
+  id            BigInt   @id @default(autoincrement())
+  tenantId      BigInt   @map("tenant_id")
+  employeeId    BigInt   @map("employee_id")
+  loanType      String   @map("loan_type") @db.VarChar(100)
+  principalAmount Decimal @map("principal_amount") @db.Decimal(12, 2)
+  interestRate  Decimal  @default(0) @map("interest_rate") @db.Decimal(5, 2)
+  tenure        Int
+  emiAmount     Decimal  @map("emi_amount") @db.Decimal(12, 2)
+  disbursedAt   DateTime? @map("disbursed_at") @db.Date
+  closedAt      DateTime? @map("closed_at") @db.Date
+  status        String   @default("Active") @db.VarChar(30)
+  notes         String?  @db.Text
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  tenant      Tenant            @relation(fields: [tenantId], references: [id])
+  employee    Employee          @relation(fields: [employeeId], references: [id])
+  repayments  LoanRepayment[]
+
+  @@index([tenantId])
+  @@index([employeeId])
+  @@map("employee_loans")
+}
+
+model LoanRepayment {
+  id          BigInt   @id @default(autoincrement())
+  loanId      BigInt   @map("loan_id")
+  installmentNo Int    @map("installment_no")
+  dueDate     DateTime @map("due_date") @db.Date
+  paidDate    DateTime? @map("paid_date") @db.Date
+  amount      Decimal  @db.Decimal(12, 2)
+  isPaid      Boolean  @default(false) @map("is_paid")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  loan EmployeeLoan @relation(fields: [loanId], references: [id])
+
+  @@index([loanId])
+  @@map("loan_repayments")
+}
+
+
+enum JobStatus {
+  Open
+  Closed
+  OnHold
+}
+
+enum ApplicationStatus {
+  Applied
+  Shortlisted
+  Interviewed
+  Selected
+  Rejected
+  Withdrawn
+}
+
+model JobPosting {
+  id              BigInt     @id @default(autoincrement())
+  tenantId        BigInt     @map("tenant_id")
+  title           String     @db.VarChar(255)
+  departmentId    BigInt?    @map("department_id")
+  designationId   BigInt?    @map("designation_id")
+  description     String?    @db.Text
+  requirements    String?    @db.Text
+  vacancies       Int        @default(1)
+  salaryMin       Decimal?   @map("salary_min") @db.Decimal(12, 2)
+  salaryMax       Decimal?   @map("salary_max") @db.Decimal(12, 2)
+  postedAt        DateTime   @default(now()) @map("posted_at")
+  closingDate     DateTime?  @map("closing_date") @db.Date
+  status          JobStatus  @default(Open)
+  createdAt       DateTime   @default(now()) @map("created_at")
+  updatedAt       DateTime   @updatedAt @map("updated_at")
+
+  tenant       Tenant               @relation(fields: [tenantId], references: [id])
+  applications JobApplication[]
+
+  @@index([tenantId])
+  @@map("job_postings")
+}
+
+model JobApplication {
+  id            BigInt            @id @default(autoincrement())
+  tenantId      BigInt            @map("tenant_id")
+  jobId         BigInt            @map("job_id")
+  candidateName String            @map("candidate_name") @db.VarChar(255)
+  email         String            @db.VarChar(150)
+  phone         String?           @db.VarChar(20)
+  resumeUrl     String?           @map("resume_url") @db.Text
+  coverLetter   String?           @map("cover_letter") @db.Text
+  experience    Int?
+  status        ApplicationStatus @default(Applied)
+  interviewDate DateTime?         @map("interview_date")
+  offerDate     DateTime?         @map("offer_date") @db.Date
+  joiningDate   DateTime?         @map("joining_date") @db.Date
+  notes         String?           @db.Text
+  createdAt     DateTime          @default(now()) @map("created_at")
+  updatedAt     DateTime          @updatedAt @map("updated_at")
+
+  tenant Tenant     @relation(fields: [tenantId], references: [id])
+  job    JobPosting @relation(fields: [jobId], references: [id])
+
+  @@index([tenantId])
+  @@index([jobId])
+  @@map("job_applications")
+}
+
+
+model DocumentVault {
+  id           BigInt   @id @default(autoincrement())
+  tenantId     BigInt   @map("tenant_id")
+  entityType   String   @map("entity_type") @db.VarChar(50)
+  entityId     BigInt   @map("entity_id")
+  docType      String   @map("doc_type") @db.VarChar(100)
+  title        String   @db.VarChar(255)
+  fileUrl      String   @map("file_url") @db.Text
+  fileMime     String?  @map("file_mime") @db.VarChar(100)
+  fileSizeKb   Int?     @map("file_size_kb")
+  expiresAt    DateTime? @map("expires_at") @db.Date
+  uploadedBy   BigInt?  @map("uploaded_by")
+  isVerified   Boolean  @default(false) @map("is_verified")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@index([entityType, entityId])
+  @@map("document_vault")
+}
+
+
+model LetterTemplate {
+  id          BigInt   @id @default(autoincrement())
+  tenantId    BigInt   @map("tenant_id")
+  name        String   @db.VarChar(255)
+  letterType  String   @map("letter_type") @db.VarChar(50)
+  subject     String?  @db.VarChar(255)
+  body        String   @db.LongText
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  tenant    Tenant           @relation(fields: [tenantId], references: [id])
+  issuances LetterIssuance[]
+
+  @@index([tenantId])
+  @@map("letter_templates")
+}
+
+model LetterIssuance {
+  id          BigInt   @id @default(autoincrement())
+  tenantId    BigInt   @map("tenant_id")
+  templateId  BigInt   @map("template_id")
+  entityType  String   @map("entity_type") @db.VarChar(50)
+  entityId    BigInt   @map("entity_id")
+  issuedTo    String   @map("issued_to") @db.VarChar(255)
+  issuedBy    BigInt?  @map("issued_by")
+  content     String   @db.LongText
+  issuedAt    DateTime @default(now()) @map("issued_at")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  tenant   Tenant         @relation(fields: [tenantId], references: [id])
+  template LetterTemplate @relation(fields: [templateId], references: [id])
+
+  @@index([tenantId])
+  @@map("letter_issuances")
+}
+
+
+enum ReviewStatus {
+  Draft
+  Submitted
+  Acknowledged
+  Finalized
+}
+
+model PerformanceReview {
+  id           BigInt       @id @default(autoincrement())
+  tenantId     BigInt       @map("tenant_id")
+  employeeId   BigInt       @map("employee_id")
+  reviewerId   BigInt?      @map("reviewer_id")
+  reviewPeriod String       @map("review_period") @db.VarChar(50)
+  reviewDate   DateTime     @map("review_date") @db.Date
+  overallScore Decimal?     @map("overall_score") @db.Decimal(4, 2)
+  status       ReviewStatus @default(Draft)
+  comments     String?      @db.Text
+  goals        String?      @db.Text
+  strengths    String?      @db.Text
+  improvements String?      @db.Text
+  createdAt    DateTime     @default(now()) @map("created_at")
+  updatedAt    DateTime     @updatedAt @map("updated_at")
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id])
+  employee Employee @relation(fields: [employeeId], references: [id])
+  ratings  PerformanceRating[]
+
+  @@index([tenantId])
+  @@index([employeeId])
+  @@map("performance_reviews")
+}
+
+model PerformanceRating {
+  id         BigInt   @id @default(autoincrement())
+  reviewId   BigInt   @map("review_id")
+  criteria   String   @db.VarChar(150)
+  score      Decimal  @db.Decimal(4, 2)
+  maxScore   Decimal  @default(5) @map("max_score") @db.Decimal(4, 2)
+  comments   String?  @db.Text
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  review PerformanceReview @relation(fields: [reviewId], references: [id])
+
+  @@index([reviewId])
+  @@map("performance_ratings")
+}
+
+
+enum AmbulanceStatus {
+  Available
+  OnCall
+  Maintenance
+  Inactive
+}
+
+model Ambulance {
+  id            BigInt          @id @default(autoincrement())
+  tenantId      BigInt          @map("tenant_id")
+  vehicleNumber String          @unique @map("vehicle_number") @db.VarChar(50)
+  vehicleType   String          @map("vehicle_type") @db.VarChar(50)
+  model         String?         @db.VarChar(100)
+  driverName    String?         @map("driver_name") @db.VarChar(150)
+  driverPhone   String?         @map("driver_phone") @db.VarChar(20)
+  status        AmbulanceStatus @default(Available)
+  gpsLocation   String?         @map("gps_location") @db.VarChar(255)
+  lastService   DateTime?       @map("last_service") @db.Date
+  nextService   DateTime?       @map("next_service") @db.Date
+  createdAt     DateTime        @default(now()) @map("created_at")
+  updatedAt     DateTime        @updatedAt @map("updated_at")
+
+  tenant    Tenant          @relation(fields: [tenantId], references: [id])
+  callLogs  AmbulanceCall[]
+
+  @@index([tenantId])
+  @@map("ambulances")
+}
+
+model AmbulanceCall {
+  id           BigInt    @id @default(autoincrement())
+  tenantId     BigInt    @map("tenant_id")
+  ambulanceId  BigInt    @map("ambulance_id")
+  patientId    BigInt?   @map("patient_id")
+  callerName   String    @map("caller_name") @db.VarChar(255)
+  callerPhone  String    @map("caller_phone") @db.VarChar(20)
+  pickupAddress String   @map("pickup_address") @db.Text
+  destination  String?   @db.Text
+  callTime     DateTime  @default(now()) @map("call_time")
+  dispatchTime DateTime? @map("dispatch_time")
+  arrivalTime  DateTime? @map("arrival_time")
+  returnTime   DateTime? @map("return_time")
+  distance     Decimal?  @db.Decimal(6, 2)
+  charges      Decimal   @default(0) @db.Decimal(10, 2)
+  notes        String?   @db.Text
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  tenant    Tenant    @relation(fields: [tenantId], references: [id])
+  ambulance Ambulance @relation(fields: [ambulanceId], references: [id])
+
+  @@index([tenantId])
+  @@index([ambulanceId])
+  @@map("ambulance_calls")
+}
+
+
+model Visitor {
+  id          BigInt    @id @default(autoincrement())
+  tenantId    BigInt    @map("tenant_id")
+  patientId   BigInt?   @map("patient_id")
+  name        String    @db.VarChar(255)
+  phone       String?   @db.VarChar(20)
+  relation    String?   @db.VarChar(100)
+  idType      String?   @map("id_type") @db.VarChar(50)
+  idNumber    String?   @map("id_number") @db.VarChar(100)
+  purpose     String?   @db.VarChar(255)
+  checkInAt   DateTime  @default(now()) @map("check_in_at")
+  checkOutAt  DateTime? @map("check_out_at")
+  badgeNumber String?   @map("badge_number") @db.VarChar(50)
+  notes       String?   @db.Text
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  tenant  Tenant   @relation(fields: [tenantId], references: [id])
+  patient Patient? @relation(fields: [patientId], references: [id])
+
+  @@index([tenantId])
+  @@index([patientId])
+  @@map("visitors")
+}
+
+
+enum ComplaintStatus {
+  Open
+  InProgress
+  Resolved
+  Closed
+  Escalated
+}
+
+enum ComplaintPriority {
+  Low
+  Medium
+  High
+  Critical
+}
+
+model Complaint {
+  id           BigInt            @id @default(autoincrement())
+  tenantId     BigInt            @map("tenant_id")
+  patientId    BigInt?           @map("patient_id")
+  complainantName String         @map("complainant_name") @db.VarChar(255)
+  phone        String?           @db.VarChar(20)
+  email        String?           @db.VarChar(150)
+  category     String            @db.VarChar(100)
+  subject      String            @db.VarChar(255)
+  description  String            @db.Text
+  priority     ComplaintPriority @default(Medium)
+  status       ComplaintStatus   @default(Open)
+  assignedTo   BigInt?           @map("assigned_to")
+  resolvedAt   DateTime?         @map("resolved_at")
+  resolution   String?           @db.Text
+  rating       Int?
+  createdAt    DateTime          @default(now()) @map("created_at")
+  updatedAt    DateTime          @updatedAt @map("updated_at")
+
+  tenant  Tenant   @relation(fields: [tenantId], references: [id])
+  patient Patient? @relation(fields: [patientId], references: [id])
+
+  @@index([tenantId])
+  @@index([status])
+  @@map("complaints")
+}
+
+
+enum MortuaryStatus {
+  Admitted
+  Released
+  PendingPostmortem
+  Postmortem
+}
+
+model MortuaryRecord {
+  id             BigInt         @id @default(autoincrement())
+  tenantId       BigInt         @map("tenant_id")
+  patientId      BigInt?        @map("patient_id")
+  deceasedName   String         @map("deceased_name") @db.VarChar(255)
+  gender         Gender?
+  age            Int?
+  dateOfDeath    DateTime       @map("date_of_death")
+  causeOfDeath   String?        @map("cause_of_death") @db.Text
+  admissionId    BigInt?        @map("admission_id")
+  lockerNumber   String?        @map("locker_number") @db.VarChar(20)
+  status         MortuaryStatus @default(Admitted)
+  releasedTo     String?        @map("released_to") @db.VarChar(255)
+  releasedAt     DateTime?      @map("released_at")
+  policeCase     Boolean        @default(false) @map("police_case")
+  policeCaseNo   String?        @map("police_case_no") @db.VarChar(100)
+  postmortem     Boolean        @default(false)
+  notes          String?        @db.Text
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+
+  tenant  Tenant   @relation(fields: [tenantId], references: [id])
+  patient Patient? @relation(fields: [patientId], references: [id])
+
+  @@index([tenantId])
+  @@index([status])
+  @@map("mortuary_records")
+}
+
+
+model QRCheckIn {
+  id            BigInt   @id @default(autoincrement())
+  tenantId      BigInt   @map("tenant_id")
+  appointmentId BigInt?  @map("appointment_id")
+  patientId     BigInt?  @map("patient_id")
+  token         String   @unique @db.VarChar(100)
+  qrData        String   @map("qr_data") @db.Text
+  checkedInAt   DateTime? @map("checked_in_at")
+  expiresAt     DateTime @map("expires_at")
+  isUsed        Boolean  @default(false) @map("is_used")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@index([token])
+  @@map("qr_checkins")
+}
+
+
+model SalaryStructure {
+  id              BigInt   @id @default(autoincrement())
+  tenantId        BigInt   @map("tenant_id")
+  name            String   @db.VarChar(150)
+  description     String?  @db.Text
+  basicPercent    Decimal  @default(50) @map("basic_percent") @db.Decimal(5, 2)
+  hraPercent      Decimal  @default(20) @map("hra_percent") @db.Decimal(5, 2)
+  daPercent       Decimal  @default(0)  @map("da_percent") @db.Decimal(5, 2)
+  medicalFixed    Decimal  @default(0)  @map("medical_fixed") @db.Decimal(12, 2)
+  travelFixed     Decimal  @default(0)  @map("travel_fixed") @db.Decimal(12, 2)
+  otherFixed      Decimal  @default(0)  @map("other_fixed") @db.Decimal(12, 2)
+  pfPercent       Decimal  @default(12) @map("pf_percent") @db.Decimal(5, 2)
+  esiPercent      Decimal  @default(0.75) @map("esi_percent") @db.Decimal(5, 2)
+  tdsPercent      Decimal  @default(0)  @map("tds_percent") @db.Decimal(5, 2)
+  pfCap           Decimal? @map("pf_cap") @db.Decimal(12, 2)
+  esiWageCap      Decimal  @default(21000) @map("esi_wage_cap") @db.Decimal(12, 2)
+  isActive        Boolean  @default(true) @map("is_active")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  tenant      Tenant               @relation(fields: [tenantId], references: [id])
+  assignments SalaryAssignment[]
+
+  @@index([tenantId])
+  @@map("salary_structures")
+}
+
+model SalaryAssignment {
+  id                BigInt   @id @default(autoincrement())
+  tenantId          BigInt   @map("tenant_id")
+  employeeId        BigInt   @map("employee_id")
+  structureId       BigInt   @map("structure_id")
+  ctc               Decimal  @db.Decimal(12, 2)
+  effectiveFrom     DateTime @map("effective_from") @db.Date
+  effectiveTo       DateTime? @map("effective_to") @db.Date
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  tenant    Tenant          @relation(fields: [tenantId], references: [id])
+  structure SalaryStructure @relation(fields: [structureId], references: [id])
+
+  @@index([tenantId])
+  @@index([employeeId])
+  @@map("salary_assignments")
+}
+
+
+model OvertimeRecord {
+  id           BigInt   @id @default(autoincrement())
+  tenantId     BigInt   @map("tenant_id")
+  employeeId   BigInt   @map("employee_id")
+  date         DateTime @db.Date
+  regularHours Decimal  @default(8) @map("regular_hours") @db.Decimal(5, 2)
+  workedHours  Decimal  @map("worked_hours") @db.Decimal(5, 2)
+  overtimeHrs  Decimal  @map("overtime_hrs") @db.Decimal(5, 2)
+  overtimeRate Decimal  @map("overtime_rate") @db.Decimal(8, 2)
+  overtimePay  Decimal  @map("overtime_pay") @db.Decimal(12, 2)
+  isApproved   Boolean  @default(false) @map("is_approved")
+  approvedBy   BigInt?  @map("approved_by")
+  notes        String?  @db.Text
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id])
+  employee Employee @relation(fields: [employeeId], references: [id])
+
+  @@index([tenantId])
+  @@index([employeeId])
+  @@map("overtime_records")
+}
+
+
+model StatutoryRegister {
+  id           BigInt   @id @default(autoincrement())
+  tenantId     BigInt   @map("tenant_id")
+  employeeId   BigInt   @map("employee_id")
+  month        Int
+  year         Int
+  grossWages   Decimal  @map("gross_wages") @db.Decimal(12, 2)
+  pfWages      Decimal  @map("pf_wages") @db.Decimal(12, 2)
+  employeePF   Decimal  @map("employee_pf") @db.Decimal(12, 2)
+  employerPF   Decimal  @map("employer_pf") @db.Decimal(12, 2)
+  esiWages     Decimal  @map("esi_wages") @db.Decimal(12, 2)
+  employeeESI  Decimal  @map("employee_esi") @db.Decimal(12, 2)
+  employerESI  Decimal  @map("employer_esi") @db.Decimal(12, 2)
+  tds          Decimal  @default(0) @db.Decimal(12, 2)
+  panNumber    String?  @map("pan_number") @db.VarChar(20)
+  pfNumber     String?  @map("pf_number") @db.VarChar(50)
+  esiNumber    String?  @map("esi_number") @db.VarChar(50)
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id])
+  employee Employee @relation(fields: [employeeId], references: [id])
+
+  @@unique([tenantId, employeeId, month, year])
+  @@index([tenantId])
+  @@index([employeeId])
+  @@map("statutory_registers")
+}
+
+
+model BookingSlug {
+  id           BigInt   @id @default(autoincrement())
+  tenantId     BigInt   @map("tenant_id")
+  slug         String   @unique @db.VarChar(100)
+  isActive     Boolean  @default(true) @map("is_active")
+  allowedDays  Json?    @map("allowed_days")
+  slotDuration Int      @default(15) @map("slot_duration")
+  startHour    Int      @default(9) @map("start_hour")
+  endHour      Int      @default(17) @map("end_hour")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@map("booking_slugs")
+}
+
+
+enum NotificationChannel {
+  SMS
+  WhatsApp
+  Email
+  Push
+}
+
+enum NotificationLogStatus {
+  Queued
+  Sent
+  Delivered
+  Failed
+}
+
+model NotificationTemplate {
+  id        BigInt              @id @default(autoincrement())
+  tenantId  BigInt              @map("tenant_id")
+  name      String              @db.VarChar(150)
+  channel   NotificationChannel
+  eventType String              @map("event_type") @db.VarChar(100)
+  subject   String?             @db.VarChar(255)
+  body      String              @db.Text
+  isActive  Boolean             @default(true) @map("is_active")
+  createdAt DateTime            @default(now()) @map("created_at")
+  updatedAt DateTime            @updatedAt @map("updated_at")
+
+  tenant Tenant              @relation(fields: [tenantId], references: [id])
+  logs   NotificationLog[]
+
+  @@index([tenantId])
+  @@map("notification_templates")
+}
+
+model NotificationLog {
+  id          BigInt                @id @default(autoincrement())
+  tenantId    BigInt                @map("tenant_id")
+  templateId  BigInt?               @map("template_id")
+  channel     NotificationChannel
+  recipient   String                @db.VarChar(255)
+  subject     String?               @db.VarChar(255)
+  body        String                @db.Text
+  status      NotificationLogStatus @default(Queued)
+  errorMsg    String?               @map("error_msg") @db.Text
+  sentAt      DateTime?             @map("sent_at")
+  entityType  String?               @map("entity_type") @db.VarChar(50)
+  entityId    BigInt?               @map("entity_id")
+  createdAt   DateTime              @default(now()) @map("created_at")
+
+  tenant   Tenant                @relation(fields: [tenantId], references: [id])
+  template NotificationTemplate? @relation(fields: [templateId], references: [id])
+
+  @@index([tenantId])
+  @@index([status])
+  @@map("notification_logs")
+}
+
+
+model PrescriptionSeal {
+  id           BigInt   @id @default(autoincrement())
+  tenantId     BigInt   @map("tenant_id")
+  doctorId     BigInt   @map("doctor_id")
+  sealText     String   @map("seal_text") @db.VarChar(500)
+  registrationNo String? @map("registration_no") @db.VarChar(100)
+  signatureUrl String?  @map("signature_url") @db.Text
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  doctor Doctor @relation(fields: [doctorId], references: [id])
+
+  @@index([tenantId])
+  @@index([doctorId])
+  @@map("prescription_seals")
+}
+
+
+enum SterilizationMethod {
+  Autoclave
+  ETO
+  DryHeat
+  Plasma
+  Chemical
+}
+
+enum CssdStatus {
+  Dirty
+  Washing
+  Packing
+  Sterilizing
+  Sterile
+  InUse
+  Expired
+  Condemned
+}
+
+model CssdItem {
+  id           BigInt    @id @default(autoincrement())
+  tenantId     BigInt    @map("tenant_id")
+  itemCode     String    @unique @map("item_code") @db.VarChar(50)
+  name         String    @db.VarChar(255)
+  category     String    @db.VarChar(100)
+  quantity     Int       @default(1)
+  department   String?   @db.VarChar(150)
+  status       CssdStatus @default(Dirty)
+  isActive     Boolean   @default(true) @map("is_active")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  tenant Tenant       @relation(fields: [tenantId], references: [id])
+  packs  CssdPackItem[]
+
+  @@index([tenantId])
+  @@index([status])
+  @@map("cssd_items")
+}
+
+model CssdPack {
+  id            BigInt             @id @default(autoincrement())
+  tenantId      BigInt             @map("tenant_id")
+  packCode      String             @unique @map("pack_code") @db.VarChar(50)
+  packName      String             @map("pack_name") @db.VarChar(255)
+  status        CssdStatus         @default(Dirty)
+  department    String?            @db.VarChar(150)
+  preparedBy    BigInt?            @map("prepared_by")
+  sterilizedAt  DateTime?          @map("sterilized_at")
+  expiresAt     DateTime?          @map("expires_at")
+  usedAt        DateTime?          @map("used_at")
+  usedFor       String?            @map("used_for") @db.VarChar(255)
+  notes         String?            @db.Text
+  createdAt     DateTime           @default(now()) @map("created_at")
+  updatedAt     DateTime           @updatedAt @map("updated_at")
+
+  tenant Tenant          @relation(fields: [tenantId], references: [id])
+  items  CssdPackItem[]
+  cycles CssdCycleItem[]
+
+  @@index([tenantId])
+  @@index([status])
+  @@map("cssd_packs")
+}
+
+model CssdPackItem {
+  id       BigInt @id @default(autoincrement())
+  packId   BigInt @map("pack_id")
+  itemId   BigInt @map("item_id")
+  quantity Int    @default(1)
+
+  pack CssdPack @relation(fields: [packId], references: [id])
+  item CssdItem @relation(fields: [itemId], references: [id])
+
+  @@index([packId])
+  @@map("cssd_pack_items")
+}
+
+model CssdCycle {
+  id                  BigInt              @id @default(autoincrement())
+  tenantId            BigInt              @map("tenant_id")
+  cycleNumber         String              @unique @map("cycle_number") @db.VarChar(50)
+  autoclaveName       String?             @map("autoclave_name") @db.VarChar(100)
+  sterilizationMethod SterilizationMethod @map("sterilization_method")
+  startedAt           DateTime            @map("started_at")
+  completedAt         DateTime?           @map("completed_at")
+  temperature         Decimal?            @db.Decimal(6, 2)
+  pressure            Decimal?            @db.Decimal(6, 2)
+  duration            Int?
+  batchIndicator      String?             @map("batch_indicator") @db.VarChar(50)
+  operatorId          BigInt?             @map("operator_id")
+  isSuccessful        Boolean             @default(true) @map("is_successful")
+  failureReason       String?             @map("failure_reason") @db.Text
+  notes               String?             @db.Text
+  createdAt           DateTime            @default(now()) @map("created_at")
+
+  tenant Tenant          @relation(fields: [tenantId], references: [id])
+  items  CssdCycleItem[]
+
+  @@index([tenantId])
+  @@map("cssd_cycles")
+}
+
+model CssdCycleItem {
+  id      BigInt @id @default(autoincrement())
+  cycleId BigInt @map("cycle_id")
+  packId  BigInt @map("pack_id")
+
+  cycle CssdCycle @relation(fields: [cycleId], references: [id])
+  pack  CssdPack  @relation(fields: [packId], references: [id])
+
+  @@index([cycleId])
+  @@map("cssd_cycle_items")
+}
+
+// UNIFIED ENCOUNTER TABLE — connects OPD / IPD / Emergency
+
+enum EncounterType {
+  OPD
+  IPD
+  Emergency
+  Teleconsultation
+}
+
+enum EncounterStatus {
+  Active
+  Completed
+  Cancelled
+  Transferred
+}
+
+model Encounter {
+  id            BigInt          @id @default(autoincrement())
+  tenantId      BigInt          @map("tenant_id")
+  patientId     BigInt          @map("patient_id")
+  doctorId      BigInt?         @map("doctor_id")
+  type          EncounterType
+  referenceType String          @map("reference_type") @db.VarChar(50)
+  referenceId   BigInt          @map("reference_id")
+  startTime     DateTime        @map("start_time")
+  endTime       DateTime?       @map("end_time")
+  status        EncounterStatus @default(Active)
+  chiefComplaint String?        @map("chief_complaint") @db.Text
+  diagnosis     String?         @db.Text
+  notes         String?         @db.Text
+  createdAt     DateTime        @default(now()) @map("created_at")
+  updatedAt     DateTime        @updatedAt @map("updated_at")
+
+  tenant  Tenant   @relation(fields: [tenantId], references: [id])
+  patient Patient  @relation(fields: [patientId], references: [id])
+  doctor  Doctor?  @relation(fields: [doctorId], references: [id])
+  orders  ClinicalOrder[]
+
+  @@index([tenantId])
+  @@index([patientId])
+  @@index([type, status])
+  @@map("encounters")
+}
+
+// SERVICE MASTER — centralized billing item catalog
+
+enum ServiceType {
+  Consultation
+  Procedure
+  Lab
+  Radiology
+  Pharmacy
+  Room
+  Nursing
+  Other
+}
+
+model ServiceMaster {
+  id            BigInt      @id @default(autoincrement())
+  tenantId      BigInt      @map("tenant_id")
+  serviceCode   String      @map("service_code") @db.VarChar(50)
+  name          String      @db.VarChar(255)
+  serviceType   ServiceType @map("service_type")
+  departmentId  BigInt?     @map("department_id")
+  standardPrice Decimal     @map("standard_price") @db.Decimal(12, 2)
+  taxPercent    Decimal     @default(0) @map("tax_percent") @db.Decimal(5, 2)
+  isActive      Boolean     @default(true) @map("is_active")
+  description   String?     @db.Text
+  createdAt     DateTime    @default(now()) @map("created_at")
+  updatedAt     DateTime    @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  orders ClinicalOrder[]
+
+  @@unique([tenantId, serviceCode])
+  @@index([tenantId])
+  @@index([serviceType])
+  @@map("service_masters")
+}
+
+// CLINICAL ORDERS — unified lab/radiology/pharmacy/procedure orders
+
+enum OrderType {
+  Lab
+  Radiology
+  Pharmacy
+  Procedure
+  Diet
+  Nursing
+}
+
+enum OrderStatus {
+  Pending
+  InProgress
+  Completed
+  Cancelled
+  OnHold
+}
+
+enum OrderPriority {
+  Routine
+  Urgent
+  Stat
+  Emergency
+}
+
+model ClinicalOrder {
+  id            BigInt        @id @default(autoincrement())
+  tenantId      BigInt        @map("tenant_id")
+  encounterId   BigInt?       @map("encounter_id")
+  patientId     BigInt        @map("patient_id")
+  doctorId      BigInt        @map("doctor_id")
+  orderType     OrderType     @map("order_type")
+  serviceId     BigInt?       @map("service_id")
+  referenceType String?       @map("reference_type") @db.VarChar(50)
+  referenceId   BigInt?       @map("reference_id")
+  status        OrderStatus   @default(Pending)
+  priority      OrderPriority @default(Routine)
+  notes         String?       @db.Text
+  orderedAt     DateTime      @default(now()) @map("ordered_at")
+  completedAt   DateTime?     @map("completed_at")
+  createdAt     DateTime      @default(now()) @map("created_at")
+  updatedAt     DateTime      @updatedAt @map("updated_at")
+
+  tenant    Tenant         @relation(fields: [tenantId], references: [id])
+  encounter Encounter?     @relation(fields: [encounterId], references: [id])
+  patient   Patient        @relation(fields: [patientId], references: [id])
+  doctor    Doctor         @relation(fields: [doctorId], references: [id])
+  service   ServiceMaster? @relation(fields: [serviceId], references: [id])
+
+  @@index([tenantId])
+  @@index([patientId])
+  @@index([encounterId])
+  @@index([status])
+  @@map("clinical_orders")
+}
+
+// PAYMENT SPLIT — multi-method payments per bill
+
+model PaymentSplit {
+  id              BigInt        @id @default(autoincrement())
+  tenantId        BigInt        @map("tenant_id")
+  billId          BigInt        @map("bill_id")
+  paymentId       BigInt?       @map("payment_id")
+  method          String        @db.VarChar(50)
+  amount          Decimal       @db.Decimal(12, 2)
+  reference       String?       @db.VarChar(255)
+  settledAt       DateTime?     @map("settled_at")
+  createdAt       DateTime      @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  bill   Bill   @relation(fields: [billId], references: [id])
+
+  @@index([tenantId])
+  @@index([billId])
+  @@map("payment_splits")
+}
+
+// BED STATUS HISTORY — live bed tracking
+
+model BedStatusHistory {
+  id          BigInt   @id @default(autoincrement())
+  tenantId    BigInt   @map("tenant_id")
+  bedId       BigInt   @map("bed_id")
+  patientId   BigInt?  @map("patient_id")
+  admissionId BigInt?  @map("admission_id")
+  fromStatus  String   @map("from_status") @db.VarChar(50)
+  toStatus    String   @map("to_status") @db.VarChar(50)
+  changedBy   BigInt?  @map("changed_by")
+  changedAt   DateTime @default(now()) @map("changed_at")
+  notes       String?  @db.Text
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  bed    Bed    @relation(fields: [bedId], references: [id])
+
+  @@index([tenantId])
+  @@index([bedId])
+  @@map("bed_status_history")
+}
+
+// ENHANCED AUDIT LOG EXTENDED — compliance-grade
+
+model AuditLogExtended {
+  id           BigInt   @id @default(autoincrement())
+  tenantId     BigInt   @map("tenant_id")
+  userId       BigInt?  @map("user_id")
+  userName     String?  @map("user_name") @db.VarChar(200)
+  role         String?  @db.VarChar(100)
+  module       String   @db.VarChar(100)
+  action       String   @db.VarChar(100)
+  entityType   String   @map("entity_type") @db.VarChar(100)
+  entityId     String   @map("entity_id") @db.VarChar(100)
+  description  String?  @db.Text
+  oldValue     Json?    @map("old_value")
+  newValue     Json?    @map("new_value")
+  ipAddress    String?  @map("ip_address") @db.VarChar(100)
+  userAgent    String?  @map("user_agent") @db.VarChar(500)
+  sessionId    String?  @map("session_id") @db.VarChar(200)
+  severity     String   @default("INFO") @db.VarChar(20)
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@index([module, action])
+  @@index([entityType, entityId])
+  @@index([userId])
+  @@index([createdAt])
+  @@map("audit_logs_extended")
+}
